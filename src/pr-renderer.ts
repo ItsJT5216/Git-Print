@@ -36,6 +36,7 @@ export interface PRMetadata {
   state: string;
   body: string | null;
   body_text?: string | null;
+  body_html?: string | null;
   author_association: string;
   created_at: string;
   updated_at: string;
@@ -1145,7 +1146,10 @@ function categorizeChecks(checks: UnifiedCheck[]) {
  * prose, and double-backtick (``…``) spans are not recognized — both rare in
  * PR comment bodies, with bounded failure direction.
  */
-function transformProse(s: string, transform: (prose: string) => string): string {
+function transformProse(
+  s: string, transform: (prose: string) => string,
+  shieldUnverifiedMultilineTags = true
+): string {
   const nonce = randomBytes(6).toString("hex");
   return s
     .split(/(```[\s\S]*?```)/g)
@@ -1164,13 +1168,15 @@ function transformProse(s: string, transform: (prose: string) => string): string
       // A multiline single-backtick span is otherwise left on the existing
       // prose path. Shield only literal tag tokens inside it so HTML cleanup
       // cannot delete source code the GitHub UI visibly renders.
-      tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) =>
-        m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
-          const token = `${nonce}:${spans.length}:`;
-          spans.push(tag);
-          return token;
-        })
-      );
+      if (shieldUnverifiedMultilineTags) {
+        tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) =>
+          m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
+            const token = `${nonce}:${spans.length}:`;
+            spans.push(tag);
+            return token;
+          })
+        );
+      }
       let out = transform(tokenized);
       for (let j = 0; j < spans.length; j++) {
         out = out.split(`${nonce}:${j}:`).join(spans[j]);
@@ -1211,6 +1217,140 @@ function maskedTransform(s: string, transform: (masked: string) => string): stri
     out = out.split(`${nonce}:${j}:`).join(stash[j]);
   }
   return out;
+}
+
+/** Decode the text of an inline <code> element in GitHub's rendered body. */
+function decodeRenderedCodeText(s: string): string {
+  return s.replace(/<[^>]*>/g, "").replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi,
+    (entity, value: string) => {
+      if (value[0] === "#") {
+        const codePoint = value[1].toLowerCase() === "x"
+          ? parseInt(value.slice(2), 16) : parseInt(value.slice(1), 10);
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+      }
+      const named: Record<string, string> = {
+        amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0",
+      };
+      return named[value.toLowerCase()] ?? entity;
+    });
+}
+
+/**
+ * Protect multiline backtick spans whose text matches an inline <code> in
+ * GitHub's rendered body. Backticks inside Qodo's raw <pre> blocks, HTML
+ * attributes, and HTML blocks are not necessarily Markdown code spans. The
+ * full REST media type already supplies body_html, so this adds no API call.
+ * If rendered HTML is unavailable, leave the existing cleaner behavior alone.
+ * A span's first content fragment is mid-line; only continuation lines can
+ * start an interrupting block. Quote markers and indentation on those lines
+ * are removed as GitHub does before matching the rendered code text.
+ */
+function protectRenderedMultilineCode(s: string, renderedHtml?: string | null):
+  { masked: string; restore: (text: string) => string } {
+  const unchanged = { masked: s, restore: (text: string) => text };
+  if (!renderedHtml || !s.includes("\n") || !s.includes("`")) return unchanged;
+
+  const inlineCode = new Map<string, number>();
+  for (const match of renderedHtml.matchAll(/<pre\b[^>]*>[\s\S]*?<\/pre>|<code\b[^>]*>([\s\S]*?)<\/code>/gi)) {
+    if (match[1] === undefined) continue; // fenced or raw <pre>, not inline code
+    const value = decodeRenderedCodeText(match[1]);
+    inlineCode.set(value, (inlineCode.get(value) ?? 0) + 1);
+  }
+  if (inlineCode.size === 0) return unchanged;
+
+  const excluded = [
+    ...s.matchAll(/<pre\b[^>]*>[\s\S]*?<\/pre>/gi),
+    ...s.matchAll(/```[\s\S]*?```/g),
+  ].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  const insideExcluded = (pos: number): boolean =>
+    excluded.some((range) => pos >= range.start && pos < range.end);
+  const insideHtmlTag = (pos: number): boolean => {
+    const open = s.lastIndexOf("<", pos);
+    if (open <= s.lastIndexOf(">", pos)) return false;
+    // A prose comparison such as `x < y` is not an HTML tag.
+    return /^<(?:\/?[A-Za-z][A-Za-z0-9:-]*\b|!--|![A-Za-z]|\?)[^>]*$/.test(s.slice(open, pos));
+  };
+  // GFM HTML block starts (types 1-6) that interrupt a paragraph, tested on
+  // each continuation line after its quote markers are removed. A span's
+  // first line starts mid-line (right after the backticks), so it never
+  // qualifies; a tab advances to column 4, so only spaces count as indent.
+  const interruptsParagraph = /^ {0,3}(?:<!--|<\?|<![A-Z]|<!\[CDATA\[|<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[ \t/>]|$)|<(?:pre|script|style|textarea)(?=[ \t>]|$))/i;
+  const quoteMarker = /^ {0,3}>[ \t]?/;
+
+  const nonce = randomBytes(6).toString("hex");
+  const stash: string[] = [];
+  const parts: string[] = [];
+  let copied = 0;
+  // Next paragraph break at or after the scan position. The scan only moves
+  // forward, so one regex pass over the body serves every opener.
+  const blank = /\n[ \t]*\n/g;
+  let boundary = -1;
+  for (let i = 0; i < s.length;) {
+    if (s[i] !== "`") { i++; continue; }
+    let start = i;
+    while (s[i] === "`") i++;
+    let slashes = 0;
+    for (let j = start - 1; j >= 0 && s[j] === "\\"; j--) slashes++;
+    if (slashes % 2) start++; // the escaped backtick is literal text
+    const width = i - start;
+    if (width === 0 || insideExcluded(start)) continue;
+
+    if (boundary < i) {
+      blank.lastIndex = i;
+      boundary = blank.exec(s)?.index ?? s.length;
+    }
+    let close = -1;
+    for (let j = i; j < boundary;) {
+      const next = s.indexOf("`", j);
+      if (next < 0 || next >= boundary) break;
+      let end = next;
+      while (s[end] === "`") end++;
+      if (end - next === width) { close = next; break; }
+      j = end;
+    }
+    if (close < 0) continue;
+    const content = s.slice(i, close);
+    if (!content.includes("\n") || insideExcluded(close)) continue;
+
+    // Quote depth of the opener's line: continuation lines drop up to that
+    // many markers (a lazy continuation line carries none).
+    const lineStart = s.lastIndexOf("\n", start - 1) + 1;
+    const lead = /^(?: {0,3}>[ \t]?)*/.exec(s.slice(lineStart, start))?.[0] ?? "";
+    const depth = (lead.match(/>/g) ?? []).length;
+    const [first, ...rest] = content.split("\n");
+    const continuation = rest.map((line) => {
+      let text = line;
+      for (let q = 0; q < depth; q++) {
+        const marker = quoteMarker.exec(text);
+        if (!marker) break;
+        text = text.slice(marker[0].length);
+      }
+      return text;
+    });
+    if (continuation.some((line) => interruptsParagraph.test(line))) continue;
+
+    // GitHub removes continuation-line indentation when rendering an inline
+    // code span, then turns each line break into one space.
+    let visible = [first, ...continuation.map((line) => line.replace(/^[ \t]+/, ""))].join(" ");
+    if (visible.startsWith(" ") && visible.endsWith(" ") && visible.trim()) {
+      visible = visible.slice(1, -1);
+    }
+    const remaining = inlineCode.get(visible) ?? 0;
+    if (remaining === 0 || insideHtmlTag(start)) continue;
+
+    inlineCode.set(visible, remaining - 1);
+    parts.push(s.slice(copied, start), `${nonce}:${stash.length}:`);
+    stash.push(s.slice(start, close + width));
+    copied = close + width;
+    i = copied;
+  }
+  if (stash.length === 0) return unchanged;
+  parts.push(s.slice(copied));
+  return {
+    masked: parts.join(""),
+    restore: (text) => text.replace(new RegExp(`${nonce}:(\\d+):`, "g"),
+      (token, index: string) => stash[Number(index)] ?? token),
+  };
 }
 
 /**
@@ -1533,7 +1673,7 @@ const LINK_DEF_LINE =
  *   - Bracket pairs without a matching definition (`arr[1][2]`, `[ERROR]: x`)
  *     — GitHub shows them literally, so we keep them literally.
  */
-function stripLinkDebris(body: string): string {
+function stripLinkDebris(body: string, shieldUnverifiedMultilineTags = true): string {
   // Pass 1 — collect defined reference labels (CommonMark matches labels
   // case-insensitively). Collected from prose only, so a definition-shaped
   // line inside a code example doesn't activate unwrapping.
@@ -1578,7 +1718,7 @@ function stripLinkDebris(body: string): string {
     s = s.replace(new RegExp(LINK_DEF_LINE.source + "\\n?", "gim"), "");
 
     return s;
-  });
+  }, shieldUnverifiedMultilineTags);
 }
 
 /**
@@ -1595,8 +1735,17 @@ function stripLinkDebris(body: string): string {
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export function cleanCommentBody(raw: string, findingHeader?: string, renderedText?: string | null): string {
+export function cleanCommentBody(
+  raw: string, findingHeader?: string, renderedText?: string | null,
+  renderedHtml?: string | null
+): string {
   let s = (raw || "").replace(/\r\n/g, "\n");
+  const protectedCode = protectRenderedMultilineCode(s, renderedHtml);
+  s = protectedCode.masked;
+  // With GitHub HTML available, the outer mask already protects confirmed
+  // inline code. Do not shield tags in backtick pairs GitHub rendered as HTML.
+  const transformCommentProse = (value: string, fn: (prose: string) => string): string =>
+    transformProse(value, fn, renderedHtml == null);
 
   // HTML comments (bot metadata markers) — invisible on the rendered PR page.
   // Masked, not split: a multi-line comment may legitimately span a fence
@@ -1614,11 +1763,11 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // Some bots double-escape newlines (literal "\n") in prose. Turn them into
   // real line breaks — but never inside fenced code blocks or inline code
   // spans, where "\n" is literal code.
-  s = transformProse(s, (seg) => seg.replace(/\\n/g, "\n"));
+  s = transformCommentProse(s, (seg) => seg.replace(/\\n/g, "\n"));
 
   // Raw-HTML images — removed completely (badges, mascots, screenshots).
   // Fence-guarded: a code example SHOWING an <img> tag keeps it.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg
       .replace(/[ \t]*<picture>[\s\S]*?<\/picture>/gi, "")
       .replace(/[ \t]*<img\b[^>]*>/gi, "")
@@ -1630,7 +1779,7 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // spaces, blank-line paragraph breaks survive. (The <pre> tags themselves
   // are stripped later with the other stray tags.) Fence/inline-code content
   // is protected by transformProse.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg.replace(/<pre>\s*([\s\S]*?)\s*<\/pre>/gi,
       (_m: string, inner: string) => "\n" + inner.replace(/([^\n])\n(?!\n)/g, "$1 ") + "\n")
   );
@@ -1638,29 +1787,38 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // Light HTML → Markdown so bot summaries stay readable. The <a> unwrap
   // keeps the visible text and drops the target — link text is content,
   // the URL is web furniture. All fence-guarded.
-  s = transformProse(s, (seg) =>
+  const emphasize = (marker: string) =>
+    (_match: string, _tag: string, inner: string): string => {
+      const core = inner.trim();
+      if (!core) return inner;
+      const lead = inner.slice(0, inner.length - inner.trimStart().length);
+      const trail = inner.slice(inner.trimEnd().length);
+      return `${lead}${marker}${core}${marker}${trail}`;
+    };
+  s = transformCommentProse(s, (seg) =>
     seg
       .replace(/[ \t]*<a\b[^>]*>\s*<\/a>/gi, "")
       .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
-      .replace(/<(?:b|strong)>\s*<(?:i|em)>([\s\S]*?)<\/(?:i|em)>\s*<\/(?:b|strong)>/gi,
+      .replace(/<(?:b|strong)\b[^>]*>\s*<(?:i|em)\b[^>]*>([\s\S]*?)<\/(?:i|em)>\s*<\/(?:b|strong)>/gi,
         (_m: string, x: string) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
-      .replace(/<(?:i|em)>\s*<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi,
+      .replace(/<(?:i|em)\b[^>]*>\s*<(?:b|strong)\b[^>]*>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi,
         (_m: string, x: string) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
-      .replace(/<\/?(?:strong|b)\b[^>]*>/gi, "**")
-      .replace(/<\/?(?:em|i)>/gi, "*")
+      .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, emphasize("**"))
+      .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, emphasize("*"))
       // <code> → inline code. Bots put markdown links INSIDE <code> (qodo's
       // file-location and rule links); once backticked they'd be shielded
       // from stripLinkDebris, so unwrap them here — keep the visible text
       // (tolerating one nested [bracket] pair: "path.ts[R496-504]"), drop
       // the URL.
-      .replace(/<code>([\s\S]*?)<\/code>/gi, (_m: string, x: string) => {
+      .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_m: string, x: string) => {
         const text = x
           .replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
           .replace(/`/g, "").trim();
         return text ? "`" + text + "`" : "";
       })
-      .replace(/<h[1-6]>([\s\S]*?)<\/h[1-6]>/gi, (_m: string, x: string) => `\n**${x.trim()}**\n`)
-      .replace(/<li>([\s\S]*?)<\/li>/gi, (_m: string, x: string) => `- ${x.trim()}\n`)
+      .replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi,
+        (_m: string, _level: string, x: string) => `\n**${x.trim()}**\n`)
+      .replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m: string, x: string) => `- ${x.trim()}\n`)
       .replace(/<br\s*\/?>/gi, "\n")
   );
 
@@ -1668,14 +1826,14 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // `pre` is included: Qodo wraps finding prose in <pre>…</pre>, which we want
   // as plain prose (its inner <b><i>identifiers</i></b> are already inline code
   // by this point), NOT a literal code block.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg.replace(/<\/?(?:details|summary|div|span|sub|sup|p|pre|kbd|samp|blockquote|ul|ol|li|h[1-6]|code|strong|b|em|i|hr|abbr|small|table|thead|tbody|tr|td|th)\b[^>]*>/gi, "")
   );
 
   // Un-escape bot-escaped leading list markers ("1\." → "1.") so numbered
   // findings (Qodo) read as real markdown instead of backslash noise.
   // Line-anchored to the leading number, so mid-prose escaped periods are safe.
-  s = transformProse(s, (seg) => seg.replace(/^(\s*\d+)\\\.(\s)/gm, "$1.$2"));
+  s = transformCommentProse(s, (seg) => seg.replace(/^(\s*\d+)\\\.(\s)/gm, "$1.$2"));
 
   // Line-level removal of pure marketing / bot-status noise (ignoring any
   // leading blockquote `>` prefix).
@@ -1721,16 +1879,25 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   s = filterProseLines(s, (line) => !dropLine(line));
 
   // Drop an orphaned "Share" heading. Fence-guarded.
-  s = transformProse(s, (seg) => seg.replace(/^#{1,6}\s*share\b.*$/gim, ""));
+  s = transformCommentProse(s, (seg) => seg.replace(/^#{1,6}\s*share\b.*$/gim, ""));
 
   // Markdown link/image debris — AFTER dropLine (which matches share-spam BY
   // its link target). Fence/inline-code protection is internal to the
   // function. See stripLinkDebris for the full keep/drop contract.
-  s = stripLinkDebris(s);
+  s = stripLinkDebris(s, renderedHtml == null);
+
+  // GitHub's rendered text tells us whether a leftover tag is visible. Do
+  // this before tidying and the empty-body guard so a tag-only card vanishes.
+  if (renderedText != null) {
+    s = transformCommentProse(s, (seg) =>
+      seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?\/?>/g,
+        (tag) => renderedText.includes(tag) ? tag : "")
+    );
+  }
 
   // Tidy whitespace and any blockquote lines left empty — outside fences
   // only, so code/diff bytes (trailing spaces, blank runs) stay exact.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg.replace(/^>\s*$/gm, "").replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n")
   ).trim();
 
@@ -1749,17 +1916,7 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // card is skipped rather than printed as a stray "---" or lone symbol.
   if (!/[\p{L}\p{N}]/u.test(s)) return "";
 
-  // GitHub's rendered text is authoritative for whether a leftover tag token
-  // is actually visible. Remove only the exact token GitHub proves invisible;
-  // code stays protected by transformProse and everything else is untouched.
-  if (renderedText != null) {
-    s = transformProse(s, (seg) =>
-      seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g,
-        (tag) => renderedText.includes(tag) ? tag : "")
-    );
-  }
-
-  return s;
+  return protectedCode.restore(s);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1844,6 +2001,21 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       !/^\s*\**\s*severity\s*:?\s*\**\s*(?:low|medium|high|critical|info|minor|major)\s*\**\s*$/i.test(line)
     );
 
+  // Inline code must be hidden before severity extraction and line filtering,
+  // which otherwise see a literal "Severity: High" line inside GitHub-rendered
+  // code as review metadata and delete it from the comment.
+  const prepareThreadComment = (comment: any): { severity: string | null; body: string } => {
+    const protectedCode = protectRenderedMultilineCode(comment.body || "", comment.body_html);
+    const severity = extractSeverity(proseOnly(protectedCode.masked));
+    const stripped = protectedCode.restore(
+      stripSeverityLine(stripSuggestionBlocks(protectedCode.masked))
+    );
+    return {
+      severity,
+      body: cleanCommentBody(stripped, undefined, comment.body_text, comment.body_html),
+    };
+  };
+
   // Render one inline review thread as clean Markdown: reviewer (+ severity),
   // file + anchor, a line-numbered ```diff code-context block, the comment
   // prose, then any suggested change as its own numbered ```diff changeset,
@@ -1856,7 +2028,8 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
     const rangeSize = sl && el ? el - sl + 1 : 1;
 
     const outdatedTag = thread.isOutdated && !resolved ? " _(outdated)_" : "";
-    const severity = extractSeverity(proseOnly(root.body || ""));
+    const rootComment = prepareThreadComment(root);
+    const severity = rootComment.severity;
     const severityTag = severity ? ` · Severity: ${severity}` : "";
     // A standalone thread card leads with its author — it IS the comment.
     // Inside a review card the UI shows a file/diff box with the commenter's
@@ -1885,7 +2058,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       blank();
     }
     const body = numberAnnotatedDiffFences(
-      cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || "")), undefined, root.body_text), fenceCtx,
+      rootComment.body, fenceCtx,
       { path: filePath, line: sl ?? el });
     if (body) { w(body); blank(); }
 
@@ -1912,12 +2085,13 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
     }
 
     for (const reply of thread.replies) {
-      const rSeverity = extractSeverity(proseOnly(reply.body || ""));
+      const replyComment = prepareThreadComment(reply);
+      const rSeverity = replyComment.severity;
       const rSeverityTag = rSeverity ? ` · Severity: ${rSeverity}` : "";
       w(`${actorEmoji(reply.user)} **${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
       blank();
       const rbody = numberAnnotatedDiffFences(
-        cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")), undefined, reply.body_text), fenceCtx,
+        replyComment.body, fenceCtx,
         { path: reply.path || filePath, line: (reply.start_line ?? reply.original_start_line ?? sl) ?? (reply.line ?? reply.original_line ?? el) });
       if (rbody) { w(rbody); blank(); }
       const rsl = reply.start_line ?? reply.original_start_line ?? sl;
@@ -1956,7 +2130,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
 
   // ── PR description (directly under the title, not labeled as a comment) ───────
   blank();
-  const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body, undefined, pr.body_text) : "";
+  const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body, undefined, pr.body_text, pr.body_html) : "";
   w(descClean || "_No description provided._");
 
   // ── PR information ───────────────────────────────────────────────────────────
@@ -2007,13 +2181,13 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       // re-captioned exactly like a comment, so the render stays one visual
       // language.
       body = numberAnnotatedDiffFences(
-        cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`, c.body_text), fenceCtx);
+        cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`, c.body_text, c.body_html), fenceCtx);
       if (!body) continue;
     } else if (card.kind === "review_event") {
       const r = card.data;
       header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
       body = numberAnnotatedDiffFences(
-        cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`, r.body_text), fenceCtx);
+        cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`, r.body_text, r.body_html), fenceCtx);
       const verdict = String(r.state || "").toUpperCase();
       const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
       if (!body && !hasVerdict && reviewThreads.length === 0) continue;
