@@ -18,8 +18,8 @@ import { cleanCommentBody } from "../dist/pr-renderer.js";
 let pass = 0;
 const failures = [];
 
-function eq(name, input, expected, renderedText) {
-  const got = cleanCommentBody(input, undefined, renderedText);
+function eq(name, input, expected, renderedText, renderedHtml) {
+  const got = cleanCommentBody(input, undefined, renderedText, renderedHtml);
   if (got === expected) { pass++; return; }
   failures.push({ name, input, expected, got });
 }
@@ -179,6 +179,193 @@ eq("rendered-text check removes only confirmed invisible tag tokens",
   "A  <relative-time datetime=\"x\">2026</relative-time>  B",
   "A  2026  B",
   "A  2026  B");
+
+// Authored raw HTML with attributes is accepted by GitHub's GFM renderer.
+eq("em tag with attributes becomes balanced emphasis",
+  'Please <em class="x">really</em> check this', 'Please *really* check this');
+eq("empty icon tag with attributes leaves no marker",
+  'Status: <i class="fa fa-check"></i> done', 'Status:  done');
+eq("unclosed bold tag leaves no dangling marker",
+  '<b>Heads up: the cache is stale', 'Heads up: the cache is stale');
+eq("edge whitespace stays outside emphasis",
+  '<strong> Note: </strong> retry later', '**Note:**  retry later');
+eq("attribute-bearing list items remain separate",
+  '<ul><li class="a">one</li><li class="b">two</li></ul>', '- one\n- two');
+eq("attribute-bearing heading keeps its break",
+  '<h3 id="s">Summary</h3>Body text here', '**Summary**\nBody text here');
+eq("attribute-bearing code keeps code formatting",
+  '<code class="language-sh">npm test</code> first', '`npm test` first');
+eq("attribute-bearing code flattens unescaped Markdown ticks like GitHub does",
+  '<code class="language-js">const s = `hi`;</code>', '`const s = hi;`',
+  'const s = hi;',
+  '<p><code class="notranslate">const s = <code class="notranslate">hi</code>;</code></p>');
+eq("attribute-bearing code retains escaped visible backticks with a safe delimiter",
+  '<code class="language-js">const s = \\`hi\\`;</code>', '``const s = `hi`;``',
+  'const s = `hi`;',
+  '<p><code class="notranslate">const s = `hi`;</code></p>');
+eq("attribute-bearing code pads a visible leading backtick safely",
+  '<code class="x">\\`leading</code>', '`` `leading ``', '`leading',
+  '<p><code class="notranslate">`leading</code></p>');
+eq("attribute-bearing code pads a visible trailing backtick safely",
+  '<code class="x">trailing\\`</code>', '`` trailing` ``', 'trailing`',
+  '<p><code class="notranslate">trailing`</code></p>');
+eq("HTML code syntax shown inside a Markdown span stays literal",
+  'Example: `<code class="x">`', 'Example: `<code class="x">`',
+  'Example: <code class="x">',
+  '<p>Example: <code class="notranslate">&lt;code class="x"&gt;</code></p>');
+eq("invisible tag-only body becomes empty before card numbering",
+  '<center>\n<img src="https://img.shields.io/badge/x.svg">\n</center>', '', '');
+eq("invisible wrapper is removed before whitespace tidy",
+  '<x-wrap>\nHello there\n</x-wrap>', 'Hello there', 'Hello there');
+
+// body_html values below reflect the GitHub GFM rendering API. It is already
+// returned by the full+json REST calls used by git-print; no live test network
+// access is required. Only spans GitHub rendered as inline <code> are shielded.
+eq("rendered multiline code keeps literal backslash-n",
+  'Change to `console.log("a\\n" +\n  "b")` please',
+  'Change to `console.log("a\\n" +\n  "b")` please',
+  'Change to console.log("a\\n" + "b") please',
+  '<p>Change to <code class="notranslate">console.log(&quot;a\\n&quot; + &quot;b&quot;)</code> please</p>');
+eq("rendered multiline code keeps link-shaped source",
+  'Call `handlers[type](event)\n  .catch(log)` instead',
+  'Call `handlers[type](event)\n  .catch(log)` instead',
+  'Call handlers[type](event) .catch(log) instead',
+  '<p>Call <code class="notranslate">handlers[type](event) .catch(log)</code> instead</p>');
+eq("rendered multiline code keeps literal HTML-comment syntax",
+  'Template: `\n    <!-- keep me -->\n    <div>x</div>`',
+  'Template: `\n    <!-- keep me -->\n    <div>x</div>`',
+  'Template: <!-- keep me --> <div>x</div>',
+  '<p>Template: <code class="notranslate"> &lt;!-- keep me --&gt; &lt;div&gt;x&lt;/div&gt;</code></p>');
+eq("custom div-like tag is not an interrupting HTML block",
+  'Use `start\n  <div-foo>x</div-foo>\n  end`',
+  'Use `start\n  <div-foo>x</div-foo>\n  end`',
+  'Use start <div-foo>x</div-foo> end',
+  '<p>Use <code class="notranslate">start &lt;div-foo&gt;x&lt;/div-foo&gt; end</code></p>');
+eq("tag at the start of a rendered code span stays code",
+  'Use `<div class="x">\n  y</div>` here',
+  'Use `<div class="x">\n  y</div>` here',
+  'Use <div class="x"> y</div> here',
+  '<p>Use <code class="notranslate">&lt;div class="x"&gt; y&lt;/div&gt;</code> here</p>');
+eq("quote markers are removed for code-span confirmation",
+  '> Use `<span>a\n> b</span>` here',
+  '> Use `<span>a\n> b</span>` here',
+  'Use <span>a b</span> here',
+  '<blockquote>\n<p>Use <code class="notranslate">&lt;span&gt;a b&lt;/span&gt;</code> here</p>\n</blockquote>');
+eq("only the first backtick of an escaped run is escaped",
+  'Use \\``<b>a\nb</b>` here',
+  'Use \\``<b>a\nb</b>` here',
+  'Use `<b>a b</b> here',
+  '<p>Use `<code class="notranslate">&lt;b&gt;a b&lt;/b&gt;</code> here</p>');
+eq("tab indentation cannot start an HTML block",
+  'Use `start\n\t<div>x</div>\nend` here',
+  'Use `start\n\t<div>x</div>\nend` here',
+  'Use start <div>x</div> end here',
+  '<p>Use <code class="notranslate">start &lt;div&gt;x&lt;/div&gt; end</code> here</p>');
+eq("output is not an interrupting GFM HTML block",
+  'Use `start\n  <output>x</output>\nend` here',
+  'Use `start\n  <output>x</output>\nend` here',
+  'Use start <output>x</output> end here',
+  '<p>Use <code class="notranslate">start &lt;output&gt;x&lt;/output&gt; end</code> here</p>');
+eq("source does interrupt the paragraph in GitHub GFM",
+  'Use `start\n  <source>x</source>\nend` here',
+  'Use `start\n  x\nend` here',
+  'Use `start x end` here',
+  '<p>Use `start</p>\n  <source>x\nend` here');
+eq("comparison before a code span is not an HTML attribute",
+  'When x < y, use `handlers[type](event)\n  .catch(log)`',
+  'When x < y, use `handlers[type](event)\n  .catch(log)`',
+  'When x < y, use handlers[type](event) .catch(log)',
+  '<p>When x &lt; y, use <code class="notranslate">handlers[type](event) .catch(log)</code></p>');
+eq("no-space comparison before code is not an HTML tag opener",
+  'When x<y, use `handlers[type](event)\n  .catch(log)`',
+  'When x<y, use `handlers[type](event)\n  .catch(log)`',
+  'When x<y, use handlers[type](event) .catch(log)',
+  '<p>When x&lt;y, use <code class="notranslate">handlers[type](event) .catch(log)</code></p>');
+eq("an earlier closed code span cannot fake an unfinished HTML tag",
+  'Example: `a <b` then `start\n  <span>[x](url)</span>\nend`',
+  'Example: `a <b` then `start\n  <span>[x](url)</span>\nend`',
+  'Example: a <b then start <span>[x](url)</span> end',
+  '<p>Example: <code class="notranslate">a &lt;b</code> then <code class="notranslate">start &lt;span&gt;[x](url)&lt;/span&gt; end</code></p>');
+eq("a literal pre example cannot exclude later confirmed code",
+  'Earlier `<pre>` then `x\n  <span>[y](url)</span>\nend` and later </pre>',
+  'Earlier `<pre>` then `x\n  <span>[y](url)</span>\nend` and later',
+  'Earlier <pre> then x <span>[y](url)</span> end and later',
+  '<p dir="auto">Earlier <code class="notranslate">&lt;pre&gt;</code> then <code class="notranslate">x &lt;span&gt;[y](url)&lt;/span&gt; end</code> and later </p>');
+eq("lazy blockquote continuation keeps its enclosing quote depth",
+  '> Intro\nUse `a\n> [x](url)`',
+  '> Intro\nUse `a\n> [x](url)`',
+  'Intro Use a [x](url)',
+  '<blockquote><p dir="auto">Intro<br>\nUse <code class="notranslate">a [x](url)</code></p></blockquote>');
+eq("nested lazy blockquote continuation keeps both quote markers",
+  '> > Intro\nUse `a\n> > [x](url)`',
+  '> > Intro\nUse `a\n> > [x](url)`',
+  'Intro Use a [x](url)',
+  '<blockquote>\n<blockquote>\n<p dir="auto">Intro<br>\nUse <code class="notranslate">a [x](url)</code></p>\n</blockquote>\n</blockquote>');
+eq("block interruption cannot consume a later heading-shaped code match",
+  'Fake: `start\n# [x](url)\nend`\n\nReal: `start\n    # [x](url)\nend`',
+  'Fake: `start\n# x\nend`\n\nReal: `start\n    # [x](url)\nend`',
+  'Fake: start x end Real: start # [x](url) end',
+  '<p dir="auto">Fake: `start</p>\n<h1 dir="auto"><a href="url">x</a></h1>\n<p dir="auto">end`</p>\n<p dir="auto">Real: <code class="notranslate">start # [x](url) end</code></p>');
+eq("block interruption cannot consume a later thematic-break code match",
+  'Fake: `start\n---\n[x](url)\nend`\n\nReal: `start\n    ---\n    [x](url)\n    end`',
+  'Fake: `start\n---\nx\nend`\n\nReal: `start\n    ---\n    [x](url)\n    end`',
+  'Fake: start x end Real: start --- [x](url) end',
+  '<h2 dir="auto">Fake: `start</h2>\n<p dir="auto"><a href="url">x</a><br>\nend`</p>\n<p dir="auto">Real: <code class="notranslate">start --- [x](url) end</code></p>');
+eq("block interruption cannot consume a later list-shaped code match",
+  'Fake: `start\n- [x](url)\nend`\n\nReal: `start\n    - [x](url)\n    end`',
+  'Fake: `start\n- x\nend`\n\nReal: `start\n    - [x](url)\n    end`',
+  'Fake: start x end Real: start - [x](url) end',
+  '<p dir="auto">Fake: `start</p>\n<ul dir="auto">\n<li><a href="url">x</a><br>\nend`</li>\n</ul>\n<p dir="auto">Real: <code class="notranslate">start - [x](url) end</code></p>');
+eq("block interruption cannot consume a later blockquote-shaped code match",
+  'Fake: `start\n> [x](url)\nend`\n\nReal: `start\n    > [x](url)\n    end`',
+  'Fake: `start\n> x\nend`\n\nReal: `start\n    > [x](url)\n    end`',
+  'Fake: start x end Real: start > [x](url) end',
+  '<p dir="auto">Fake: `start</p>\n<blockquote>\n<p dir="auto"><a href="url">x</a><br>\nend`</p>\n</blockquote>\n<p dir="auto">Real: <code class="notranslate">start &gt; [x](url) end</code></p>');
+eq("block interruption cannot consume code from a later fenced block match",
+  'Fake: `start\n```text\n[x](url)\n```\nend`\n\nReal: `start\n    ```text\n    [x](url)\n    ```\n    end`',
+  'Fake: `start\n```text\n[x](url)\n```\nend`\n\nReal: `start\n    ```text\n    [x](url)\n    ```\n    end`',
+  'Fake: start x end Real: start ```text [x](url) ``` end',
+  '<p dir="auto">Fake: `start</p>\n<pre lang="text" class="notranslate"><code class="notranslate">[x](url)\n</code></pre>\n<p dir="auto">end`</p>\n<p dir="auto">Real: <code class="notranslate">start ```text [x](url) ``` end</code></p>');
+eq("single-line code cannot consume a later multiline code occurrence",
+  'Use `x`\na [x](url) ` a [x](url)\n`',
+  'Use `x`\na x ` a [x](url)\n`',
+  'Use x a x a [x](url)',
+  '<p dir="auto">Use <code class="notranslate">x</code><br>\na <a href="url">x</a> <code class="notranslate">a [x](url)</code></p>');
+eq("a single-line span does not desynchronize the reported CodeRabbit example",
+  'Use `x` and `<div class="a">\n  y</div>` here',
+  'Use `x` and `<div class="a">\n  y</div>` here',
+  'Use x and <div class="a"> y</div> here',
+  '<p dir="auto">Use <code class="notranslate">x</code> and <code class="notranslate">&lt;div class="a"&gt; y&lt;/div&gt;</code> here</p>');
+eq("rendered double-backtick multiline span keeps link-shaped code",
+  'Use ``a ` [x](url)\n  b`` here',
+  'Use ``a ` [x](url)\n  b`` here',
+  'Use a ` [x](url) b here',
+  '<p>Use <code class="notranslate">a ` [x](url) b</code> here</p>');
+eq("rendered multiline code is safe from bot-noise line filter",
+  'Code: `\nCopilot uses AI. Check for mistakes.\nkeep` please',
+  'Code: `\nCopilot uses AI. Check for mistakes.\nkeep` please',
+  'Code: Copilot uses AI. Check for mistakes. keep please',
+  '<p>Code: <code class="notranslate"> Copilot uses AI. Check for mistakes. keep</code> please</p>');
+eq("HTML comment block is not mistaken for inline code",
+  'Use `before\n  <!-- keep me -->\n  after` here',
+  'Use `before\n\n  after` here',
+  'Use `before after` here',
+  '<p>Use `before</p>\n<p>after` here</p>');
+eq("HTML block interrupting a pseudo code span loses invisible tags",
+  'Use `start\n  <div>x</div>\n  end`',
+  'Use `start\n  x\n  end`',
+  'Use `start x end`',
+  '<p>Use `start</p>\n  <div>x</div>\n  end`');
+eq("hidden HTML block cannot consume a later real code match",
+  'Fake: `\n  <!-- keep me -->\n  <div>x</div>`\n\nReal: `\n    <!-- keep me -->\n    <div>x</div>`',
+  'Fake: `\n\n  x`\n\nReal: `\n    <!-- keep me -->\n    <div>x</div>`',
+  'Fake: ` x Real: <!-- keep me --> <div>x</div>',
+  '<p>Fake: `</p>\n  \n  <div>x</div>`\n<p>Real: <code class="notranslate"> &lt;!-- keep me --&gt; &lt;div&gt;x&lt;/div&gt;</code></p>');
+eq("Qodo pre hard wraps still reflow despite backticks",
+  '<pre>reads `SELECT version ... LIMIT\n1`, next</pre>',
+  'reads `SELECT version ... LIMIT 1`, next',
+  'reads `SELECT version ... LIMIT\n1`, next',
+  '<pre class="notranslate">reads `SELECT version ... LIMIT\n1`, next</pre>');
 
 // ─── Review-audit regression cases (findings 2.1–2.6) ───────────────────────
 

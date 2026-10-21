@@ -26,6 +26,7 @@ export interface PRMetadata {
     state: string;
     body: string | null;
     body_text?: string | null;
+    body_html?: string | null;
     author_association: string;
     created_at: string;
     updated_at: string;
@@ -236,7 +237,7 @@ export declare function attachAutomatedSuggestions(prHtmlUrl: string | undefined
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export declare function cleanCommentBody(raw: string, findingHeader?: string, renderedText?: string | null): string;
+export declare function cleanCommentBody(raw: string, findingHeader?: string, renderedText?: string | null, renderedHtml?: string | null): string;
 export declare function renderPR(data: PRData, options: PRRendererOptions): Promise<void>;
 export declare function renderReport(data: PRData, options: PRRendererOptions): Promise<void>;
 /**

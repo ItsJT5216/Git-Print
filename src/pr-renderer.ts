@@ -36,6 +36,7 @@ export interface PRMetadata {
   state: string;
   body: string | null;
   body_text?: string | null;
+  body_html?: string | null;
   author_association: string;
   created_at: string;
   updated_at: string;
@@ -1124,28 +1125,54 @@ function categorizeChecks(checks: UnifiedCheck[]) {
   return { inProgress, passed, failed };
 }
 
+/** Replace complete, single-line code spans of any delimiter width. */
+function tokenizeInlineCodeSpans(
+  prose: string, nonce: string, spans: string[]
+): string {
+  let out = "";
+  for (let i = 0; i < prose.length;) {
+    if (prose[i] !== "`") { out += prose[i++]; continue; }
+    const start = i;
+    while (prose[i] === "`") i++;
+    let slashes = 0;
+    for (let j = start - 1; j >= 0 && prose[j] === "\\"; j--) slashes++;
+    if (slashes % 2) {
+      out += prose.slice(start, i);
+      continue;
+    }
+    const width = i - start;
+    let close = -1;
+    for (let j = i; j < prose.length && prose[j] !== "\n";) {
+      const next = prose.indexOf("`", j);
+      const lineEnd = prose.indexOf("\n", j);
+      if (next < 0 || (lineEnd >= 0 && lineEnd < next)) break;
+      let end = next;
+      while (prose[end] === "`") end++;
+      if (end - next === width) { close = next; break; }
+      j = end;
+    }
+    if (close < 0) {
+      out += prose.slice(start, i);
+      continue;
+    }
+    const token = `${nonce}:${spans.length}:`;
+    spans.push(prose.slice(start, close + width));
+    out += token;
+    i = close + width;
+  }
+  return out;
+}
+
 /**
- * Run `transform` on the prose of `s` while protecting code byte-for-byte:
- *
- *   - Fenced blocks (``` … ```) are cut out entirely and never shown to the
- *     transform — review diffs, suggestion bodies, and code examples must
- *     never be altered by prose cleanup.
- *   - Inline code spans (`…`) are replaced with inert placeholder tokens
- *     before the transform and restored after. Tokenizing (rather than
- *     splitting) keeps the surrounding prose CONTIGUOUS, so patterns that
- *     straddle a code span — the very common [`file.ts`](url) link shape —
- *     still match, while the span's contents (`[x](y)`, `<https://…>`,
- *     `<img>`) can never be mistaken for removable debris.
- *
- * A token deleted by the transform (e.g. a code span inside a removed HTML
- * comment) simply restores nothing — deletion of a protected span can only
- * happen when its whole enclosing construct was removed.
- *
- * Known accepted limitations: an unclosed fence leaves its tail treated as
- * prose, and double-backtick (``…``) spans are not recognized — both rare in
- * PR comment bodies, with bounded failure direction.
+ * Run `transform` on prose while preserving fences and complete inline code
+ * spans byte-for-byte. A nonce token keeps surrounding prose contiguous so
+ * cleanup patterns can still match across a code span without editing it.
+ * An unclosed fence leaves its tail on the prose path.
  */
-function transformProse(s: string, transform: (prose: string) => string): string {
+function transformProse(
+  s: string, transform: (prose: string) => string,
+  shieldUnverifiedMultilineTags = true
+): string {
   const nonce = randomBytes(6).toString("hex");
   return s
     .split(/(```[\s\S]*?```)/g)
@@ -1156,21 +1183,19 @@ function transformProse(s: string, transform: (prose: string) => string): string
       // consume adjacent whitespace and punctuation, and a delimiter that got
       // consumed would break restoration — deleting the code span and leaking
       // token text. Plain hex with colons survives every pass untouched.
-      let tokenized = part.replace(/`[^`\n]*`/g, (m) => {
-        const token = `${nonce}:${spans.length}:`;
-        spans.push(m);
-        return token;
-      });
+      let tokenized = tokenizeInlineCodeSpans(part, nonce, spans);
       // A multiline single-backtick span is otherwise left on the existing
       // prose path. Shield only literal tag tokens inside it so HTML cleanup
       // cannot delete source code the GitHub UI visibly renders.
-      tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) =>
-        m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
-          const token = `${nonce}:${spans.length}:`;
-          spans.push(tag);
-          return token;
-        })
-      );
+      if (shieldUnverifiedMultilineTags) {
+        tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) =>
+          m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
+            const token = `${nonce}:${spans.length}:`;
+            spans.push(tag);
+            return token;
+          })
+        );
+      }
       let out = transform(tokenized);
       for (let j = 0; j < spans.length; j++) {
         out = out.split(`${nonce}:${j}:`).join(spans[j]);
@@ -1211,6 +1236,291 @@ function maskedTransform(s: string, transform: (masked: string) => string): stri
     out = out.split(`${nonce}:${j}:`).join(stash[j]);
   }
   return out;
+}
+
+/** Decode the text of an inline <code> element in GitHub's rendered body. */
+function decodeRenderedCodeText(s: string): string {
+  return s.replace(/<[^>]*>/g, "").replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi,
+    (entity, value: string) => {
+      if (value[0] === "#") {
+        const codePoint = value[1].toLowerCase() === "x"
+          ? parseInt(value.slice(2), 16) : parseInt(value.slice(1), 10);
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+      }
+      const named: Record<string, string> = {
+        amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0",
+      };
+      return named[value.toLowerCase()] ?? entity;
+    });
+}
+
+/** True when a source position is inside a paired Markdown backtick span. */
+function insideBacktickSpan(s: string, position: number): boolean {
+  let delimiter = 0;
+  for (let i = 0; i < position;) {
+    if (s[i] !== "`") { i++; continue; }
+    const start = i;
+    while (s[i] === "`") i++;
+    let slashes = 0;
+    for (let j = start - 1; j >= 0 && s[j] === "\\"; j--) slashes++;
+    if (slashes % 2) continue;
+    const width = i - start;
+    if (delimiter === 0) delimiter = width;
+    else if (delimiter === width) delimiter = 0;
+  }
+  return delimiter !== 0;
+}
+
+/** Markdown inside an authored raw <code> element is still parsed by GitHub.
+ * Remove delimiter runs while retaining escaped backticks that are visible
+ * text. This keeps the cleaner from turning `\\`` into a missing character. */
+function rawCodeElementText(source: string): string {
+  let out = "";
+  for (let i = 0; i < source.length;) {
+    if (source[i] === "\\") {
+      const start = i;
+      while (source[i] === "\\") i++;
+      const slashes = i - start;
+      if (source[i] === "`") {
+        let end = i;
+        while (source[end] === "`") end++;
+        const width = end - i;
+        out += "\\".repeat(Math.floor(slashes / 2));
+        if (slashes % 2) {
+          out += "`".repeat(width);
+          i = end;
+        }
+        // With an even run the ticks are unescaped Markdown delimiters. Leave
+        // the cursor on them so the normal matching logic below can consume it.
+        continue;
+      }
+      out += "\\".repeat(slashes);
+      continue;
+    }
+
+    if (source[i] !== "`") { out += source[i++]; continue; }
+    const start = i;
+    while (source[i] === "`") i++;
+    const width = i - start;
+    let close = -1;
+    for (let j = i; j < source.length;) {
+      const next = source.indexOf("`", j);
+      if (next < 0) break;
+      let end = next;
+      while (source[end] === "`") end++;
+      let slashes = 0;
+      for (let k = next - 1; k >= 0 && source[k] === "\\"; k--) slashes++;
+      if (slashes % 2 === 0 && end - next === width) { close = next; break; }
+      j = end;
+    }
+    if (close < 0) {
+      out += "`".repeat(width);
+      continue;
+    }
+    let inner = source.slice(i, close).replace(/\r\n?/g, "\n").replace(/\n/g, " ");
+    if (inner.startsWith(" ") && inner.endsWith(" ") && inner.trim()) {
+      inner = inner.slice(1, -1);
+    }
+    out += inner;
+    i = close + width;
+  }
+  return out;
+}
+
+/** Make a Markdown code span whose delimiter cannot collide with its text. */
+function asMarkdownCodeSpan(text: string): string {
+  let longest = 0;
+  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
+  const delimiter = "`".repeat(longest + 1);
+  const pad = text.startsWith("`") || text.endsWith("`") || text.startsWith(" ") || text.endsWith(" ");
+  return `${delimiter}${pad ? " " : ""}${text}${pad ? " " : ""}${delimiter}`;
+}
+
+/**
+ * Protect multiline backtick spans whose text matches an inline <code> in
+ * GitHub's rendered body. Backticks inside Qodo's raw <pre> blocks, HTML
+ * attributes, and HTML blocks are not necessarily Markdown code spans. The
+ * full REST media type already supplies body_html, so this adds no API call.
+ * If rendered HTML is unavailable, leave the existing cleaner behavior alone.
+ * A span's first content fragment is mid-line; only continuation lines can
+ * start an interrupting block. Quote markers and indentation on those lines
+ * are removed as GitHub does before matching the rendered code text.
+ */
+function protectRenderedMultilineCode(s: string, renderedHtml?: string | null):
+  { masked: string; restore: (text: string) => string } {
+  s = (s || "").replace(/\r\n/g, "\n");
+  const unchanged = { masked: s, restore: (text: string) => text };
+  if (!renderedHtml || !s.includes("\n") || !s.includes("`")) return unchanged;
+
+  const inlineCode = new Map<string, number>();
+  for (const match of renderedHtml.matchAll(/<pre\b[^>]*>[\s\S]*?<\/pre>|<code\b[^>]*>([\s\S]*?)<\/code>/gi)) {
+    if (match[1] === undefined) continue; // fenced or raw <pre>, not inline code
+    const value = decodeRenderedCodeText(match[1]);
+    inlineCode.set(value, (inlineCode.get(value) ?? 0) + 1);
+  }
+  if (inlineCode.size === 0) return unchanged;
+
+  const excluded = [
+    ...s.matchAll(/<pre\b[^>]*>[\s\S]*?<\/pre>/gi),
+    ...s.matchAll(/```[\s\S]*?```/g),
+    ...s.matchAll(/~~~[\s\S]*?~~~/g),
+  ].filter((m) => !insideBacktickSpan(s, m.index ?? 0))
+    .map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  const insideExcluded = (pos: number): boolean =>
+    excluded.some((range) => pos >= range.start && pos < range.end);
+  const sourceCodeSpans: Array<{ start: number; end: number }> = [];
+  const insideSourceCode = (pos: number): boolean =>
+    sourceCodeSpans.some((range) => pos >= range.start && pos < range.end);
+  const insideHtmlTag = (pos: number): boolean => {
+    let open = s.lastIndexOf("<", pos);
+    while (open >= 0 && insideSourceCode(open)) open = s.lastIndexOf("<", open - 1);
+    let close = s.lastIndexOf(">", pos);
+    while (close >= 0 && insideSourceCode(close)) close = s.lastIndexOf(">", close - 1);
+    if (open <= close) return false;
+    // A prose comparison such as `x < y` is not an HTML tag.
+    return /^<(?:\/?[A-Za-z][A-Za-z0-9:-]*(?=[\t\n\f\r />]|$)|!--|![A-Za-z]|\?)[^>]*$/.test(s.slice(open, pos));
+  };
+  // GFM block starts that can interrupt a paragraph. The HTML element list is
+  // the GFM list (including <source>, excluding <output>); the other branches
+  // cover headings, thematic breaks, lists, quotes, and fenced code.
+  const interruptsParagraph = /^ {0,3}(?:<!--|<\?|<![A-Z]|<!\[CDATA\[|<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[ \t/>]|$)|<(?:pre|script|style|textarea)(?=[ \t>]|$)|`{3,}|~{3,}|#{1,6}(?=[ \t]|$)|>[ \t]?|(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})|[-+*](?=[ \t]|$)|1[.)](?=[ \t]|$))/i;
+  const quoteMarker = /^ {0,3}>[ \t]?/;
+
+  const lines = s.split("\n");
+  const lineStarts = [0];
+  for (let i = 0; i < s.length; i++) if (s[i] === "\n") lineStarts.push(i + 1);
+  const quoteInfo = lines.map((line) => {
+    let text = line;
+    let explicitDepth = 0;
+    let marker: RegExpExecArray | null;
+    while ((marker = quoteMarker.exec(text))) {
+      explicitDepth++;
+      text = text.slice(marker[0].length);
+    }
+    return { line, text, explicitDepth, effectiveDepth: 0 };
+  });
+  let lazyQuoteDepth = 0;
+  for (const info of quoteInfo) {
+    if (info.explicitDepth > 0) {
+      info.effectiveDepth = info.explicitDepth;
+      lazyQuoteDepth = info.text.trim() && !interruptsParagraph.test(info.text) ? info.explicitDepth : 0;
+    } else if (!info.line.trim()) {
+      lazyQuoteDepth = 0;
+    } else if (lazyQuoteDepth > 0 && !interruptsParagraph.test(info.line)) {
+      info.effectiveDepth = lazyQuoteDepth;
+    } else {
+      lazyQuoteDepth = 0;
+    }
+  }
+  const lineIndexAt = (pos: number): number => {
+    let lo = 0, hi = lineStarts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (lineStarts[mid] <= pos) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.max(0, lo - 1);
+  };
+  const stripQuoteDepth = (line: string, depth: number): string => {
+    let text = line;
+    for (let q = 0; q < depth; q++) {
+      const marker = quoteMarker.exec(text);
+      if (!marker) break;
+      text = text.slice(marker[0].length);
+    }
+    return text;
+  };
+
+  const nonce = randomBytes(6).toString("hex");
+  const stash: string[] = [];
+  const parts: string[] = [];
+  let copied = 0;
+  // Next paragraph break at or after the scan position. The scan only moves
+  // forward, so one regex pass over the body serves every opener.
+  const blank = /\n[ \t]*\n/g;
+  let boundary = -1;
+  for (let i = 0; i < s.length;) {
+    if (s[i] !== "`") { i++; continue; }
+    let start = i;
+    while (s[i] === "`") i++;
+    let slashes = 0;
+    for (let j = start - 1; j >= 0 && s[j] === "\\"; j--) slashes++;
+    if (slashes % 2) start++; // the escaped backtick is literal text
+    const width = i - start;
+    if (width === 0 || insideExcluded(start)) continue;
+
+    if (boundary < i) {
+      blank.lastIndex = i;
+      boundary = blank.exec(s)?.index ?? s.length;
+    }
+    let close = -1;
+    for (let j = i; j < boundary;) {
+      const next = s.indexOf("`", j);
+      if (next < 0 || next >= boundary) break;
+      let end = next;
+      while (s[end] === "`") end++;
+      if (end - next === width) { close = next; break; }
+      j = end;
+    }
+    if (close < 0) continue;
+    const content = s.slice(i, close);
+    if (insideExcluded(close)) continue;
+
+    // Even an unprotected valid single-line span consumes its closer. If the
+    // closer is scanned again as an opener it can steal another rendered code
+    // occurrence and leave a later confirmed span exposed.
+    if (!content.includes("\n")) {
+      if (!insideHtmlTag(start)) sourceCodeSpans.push({ start, end: close + width });
+      i = close + width;
+      continue;
+    }
+
+    const lineStart = s.lastIndexOf("\n", start - 1) + 1;
+    const openerLine = lineIndexAt(start);
+    const depth = quoteInfo[openerLine]?.effectiveDepth ?? 0;
+    const [first, ...rest] = content.split("\n");
+    let quoteMismatch = false;
+    const continuation = rest.map((line, offset) => {
+      const info = quoteInfo[openerLine + offset + 1];
+      if (!info) return line;
+      if (depth > 0 && info.explicitDepth > 0 && info.explicitDepth < depth) quoteMismatch = true;
+      if (depth > 0 && info.explicitDepth === 0 && info.effectiveDepth !== depth) quoteMismatch = true;
+      return depth > 0 ? stripQuoteDepth(line, depth) : line;
+    });
+    if (quoteMismatch) continue;
+    if (continuation.some((line) => interruptsParagraph.test(line))) continue;
+
+    // GitHub removes continuation-line indentation when rendering an inline
+    // code span, then turns each line break into one space.
+    let visible = [first, ...continuation.map((line) => line.replace(/^[ \t]+/, ""))].join(" ");
+    if (visible.startsWith(" ") && visible.endsWith(" ") && visible.trim()) {
+      visible = visible.slice(1, -1);
+    }
+    if (insideHtmlTag(start)) {
+      sourceCodeSpans.push({ start, end: close + width });
+      i = close + width;
+      continue;
+    }
+    sourceCodeSpans.push({ start, end: close + width });
+    const remaining = inlineCode.get(visible) ?? 0;
+    if (remaining === 0) {
+      i = close + width;
+      continue;
+    }
+
+    inlineCode.set(visible, remaining - 1);
+    parts.push(s.slice(copied, start), `${nonce}:${stash.length}:`);
+    stash.push(s.slice(start, close + width));
+    copied = close + width;
+    i = copied;
+  }
+  if (stash.length === 0) return unchanged;
+  parts.push(s.slice(copied));
+  return {
+    masked: parts.join(""),
+    restore: (text) => text.replace(new RegExp(`${nonce}:(\\d+):`, "g"),
+      (token, index: string) => stash[Number(index)] ?? token),
+  };
 }
 
 /**
@@ -1533,7 +1843,7 @@ const LINK_DEF_LINE =
  *   - Bracket pairs without a matching definition (`arr[1][2]`, `[ERROR]: x`)
  *     — GitHub shows them literally, so we keep them literally.
  */
-function stripLinkDebris(body: string): string {
+function stripLinkDebris(body: string, shieldUnverifiedMultilineTags = true): string {
   // Pass 1 — collect defined reference labels (CommonMark matches labels
   // case-insensitively). Collected from prose only, so a definition-shaped
   // line inside a code example doesn't activate unwrapping.
@@ -1578,7 +1888,7 @@ function stripLinkDebris(body: string): string {
     s = s.replace(new RegExp(LINK_DEF_LINE.source + "\\n?", "gim"), "");
 
     return s;
-  });
+  }, shieldUnverifiedMultilineTags);
 }
 
 /**
@@ -1595,8 +1905,35 @@ function stripLinkDebris(body: string): string {
  *           HTML comments, collapsed bot boilerplate, share/promo/status
  *           lines, and whole comments that are nothing but promotion.
  */
-export function cleanCommentBody(raw: string, findingHeader?: string, renderedText?: string | null): string {
+export function cleanCommentBody(
+  raw: string, findingHeader?: string, renderedText?: string | null,
+  renderedHtml?: string | null
+): string {
   let s = (raw || "").replace(/\r\n/g, "\n");
+  const protectedCode = protectRenderedMultilineCode(s, renderedHtml);
+  s = protectedCode.masked;
+  // With GitHub HTML available, the outer mask already protects confirmed
+  // inline code. Do not shield tags in backtick pairs GitHub rendered as HTML.
+  const transformCommentProse = (
+    value: string, fn: (prose: string) => string, convertRawCodeElements = false
+  ): string => {
+    let input = value;
+    if (convertRawCodeElements) {
+      input = value.split(/(```[\s\S]*?```)/g).map((part, index) => {
+        if (index % 2 === 1) return part;
+        return part.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi,
+          (match: string, inner: string, offset: number) => {
+            if (insideBacktickSpan(part, offset)) return match;
+            const text = rawCodeElementText(inner)
+              .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
+              .replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
+              .trim();
+            return text ? asMarkdownCodeSpan(text) : "";
+          });
+      }).join("");
+    }
+    return transformProse(input, fn, renderedHtml == null);
+  };
 
   // HTML comments (bot metadata markers) — invisible on the rendered PR page.
   // Masked, not split: a multi-line comment may legitimately span a fence
@@ -1614,11 +1951,11 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // Some bots double-escape newlines (literal "\n") in prose. Turn them into
   // real line breaks — but never inside fenced code blocks or inline code
   // spans, where "\n" is literal code.
-  s = transformProse(s, (seg) => seg.replace(/\\n/g, "\n"));
+  s = transformCommentProse(s, (seg) => seg.replace(/\\n/g, "\n"));
 
   // Raw-HTML images — removed completely (badges, mascots, screenshots).
   // Fence-guarded: a code example SHOWING an <img> tag keeps it.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg
       .replace(/[ \t]*<picture>[\s\S]*?<\/picture>/gi, "")
       .replace(/[ \t]*<img\b[^>]*>/gi, "")
@@ -1630,7 +1967,7 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // spaces, blank-line paragraph breaks survive. (The <pre> tags themselves
   // are stripped later with the other stray tags.) Fence/inline-code content
   // is protected by transformProse.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg.replace(/<pre>\s*([\s\S]*?)\s*<\/pre>/gi,
       (_m: string, inner: string) => "\n" + inner.replace(/([^\n])\n(?!\n)/g, "$1 ") + "\n")
   );
@@ -1638,44 +1975,44 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // Light HTML → Markdown so bot summaries stay readable. The <a> unwrap
   // keeps the visible text and drops the target — link text is content,
   // the URL is web furniture. All fence-guarded.
-  s = transformProse(s, (seg) =>
-    seg
+  const emphasize = (marker: string) =>
+    (_match: string, _tag: string, inner: string): string => {
+      const core = inner.trim();
+      if (!core) return inner;
+      const lead = inner.slice(0, inner.length - inner.trimStart().length);
+      const trail = inner.slice(inner.trimEnd().length);
+      return `${lead}${marker}${core}${marker}${trail}`;
+    };
+  s = transformCommentProse(
+    s,
+    (seg) => seg
       .replace(/[ \t]*<a\b[^>]*>\s*<\/a>/gi, "")
       .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
-      .replace(/<(?:b|strong)>\s*<(?:i|em)>([\s\S]*?)<\/(?:i|em)>\s*<\/(?:b|strong)>/gi,
+      .replace(/<(?:b|strong)\b[^>]*>\s*<(?:i|em)\b[^>]*>([\s\S]*?)<\/(?:i|em)>\s*<\/(?:b|strong)>/gi,
         (_m: string, x: string) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
-      .replace(/<(?:i|em)>\s*<(?:b|strong)>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi,
+      .replace(/<(?:i|em)\b[^>]*>\s*<(?:b|strong)\b[^>]*>([\s\S]*?)<\/(?:b|strong)>\s*<\/(?:i|em)>/gi,
         (_m: string, x: string) => "`" + x.replace(/<[^>]+>/g, "").replace(/`/g, "").trim() + "`")
-      .replace(/<\/?(?:strong|b)\b[^>]*>/gi, "**")
-      .replace(/<\/?(?:em|i)>/gi, "*")
-      // <code> → inline code. Bots put markdown links INSIDE <code> (qodo's
-      // file-location and rule links); once backticked they'd be shielded
-      // from stripLinkDebris, so unwrap them here — keep the visible text
-      // (tolerating one nested [bracket] pair: "path.ts[R496-504]"), drop
-      // the URL.
-      .replace(/<code>([\s\S]*?)<\/code>/gi, (_m: string, x: string) => {
-        const text = x
-          .replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
-          .replace(/`/g, "").trim();
-        return text ? "`" + text + "`" : "";
-      })
-      .replace(/<h[1-6]>([\s\S]*?)<\/h[1-6]>/gi, (_m: string, x: string) => `\n**${x.trim()}**\n`)
-      .replace(/<li>([\s\S]*?)<\/li>/gi, (_m: string, x: string) => `- ${x.trim()}\n`)
-      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, emphasize("**"))
+      .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, emphasize("*"))
+      .replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi,
+        (_m: string, _level: string, x: string) => `\n**${x.trim()}**\n`)
+      .replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m: string, x: string) => `- ${x.trim()}\n`)
+      .replace(/<br\s*\/?>/gi, "\n"),
+    true
   );
 
   // Strip any remaining stray tags but keep their inner text. Fence-guarded.
   // `pre` is included: Qodo wraps finding prose in <pre>…</pre>, which we want
   // as plain prose (its inner <b><i>identifiers</i></b> are already inline code
   // by this point), NOT a literal code block.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg.replace(/<\/?(?:details|summary|div|span|sub|sup|p|pre|kbd|samp|blockquote|ul|ol|li|h[1-6]|code|strong|b|em|i|hr|abbr|small|table|thead|tbody|tr|td|th)\b[^>]*>/gi, "")
   );
 
   // Un-escape bot-escaped leading list markers ("1\." → "1.") so numbered
   // findings (Qodo) read as real markdown instead of backslash noise.
   // Line-anchored to the leading number, so mid-prose escaped periods are safe.
-  s = transformProse(s, (seg) => seg.replace(/^(\s*\d+)\\\.(\s)/gm, "$1.$2"));
+  s = transformCommentProse(s, (seg) => seg.replace(/^(\s*\d+)\\\.(\s)/gm, "$1.$2"));
 
   // Line-level removal of pure marketing / bot-status noise (ignoring any
   // leading blockquote `>` prefix).
@@ -1721,16 +2058,25 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   s = filterProseLines(s, (line) => !dropLine(line));
 
   // Drop an orphaned "Share" heading. Fence-guarded.
-  s = transformProse(s, (seg) => seg.replace(/^#{1,6}\s*share\b.*$/gim, ""));
+  s = transformCommentProse(s, (seg) => seg.replace(/^#{1,6}\s*share\b.*$/gim, ""));
 
   // Markdown link/image debris — AFTER dropLine (which matches share-spam BY
   // its link target). Fence/inline-code protection is internal to the
   // function. See stripLinkDebris for the full keep/drop contract.
-  s = stripLinkDebris(s);
+  s = stripLinkDebris(s, renderedHtml == null);
+
+  // GitHub's rendered text tells us whether a leftover tag is visible. Do
+  // this before tidying and the empty-body guard so a tag-only card vanishes.
+  if (renderedText != null) {
+    s = transformCommentProse(s, (seg) =>
+      seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?\/?>/g,
+        (tag) => renderedText.includes(tag) ? tag : "")
+    );
+  }
 
   // Tidy whitespace and any blockquote lines left empty — outside fences
   // only, so code/diff bytes (trailing spaces, blank runs) stay exact.
-  s = transformProse(s, (seg) =>
+  s = transformCommentProse(s, (seg) =>
     seg.replace(/^>\s*$/gm, "").replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n")
   ).trim();
 
@@ -1749,17 +2095,7 @@ export function cleanCommentBody(raw: string, findingHeader?: string, renderedTe
   // card is skipped rather than printed as a stray "---" or lone symbol.
   if (!/[\p{L}\p{N}]/u.test(s)) return "";
 
-  // GitHub's rendered text is authoritative for whether a leftover tag token
-  // is actually visible. Remove only the exact token GitHub proves invisible;
-  // code stays protected by transformProse and everything else is untouched.
-  if (renderedText != null) {
-    s = transformProse(s, (seg) =>
-      seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g,
-        (tag) => renderedText.includes(tag) ? tag : "")
-    );
-  }
-
-  return s;
+  return protectedCode.restore(s);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1844,6 +2180,22 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       !/^\s*\**\s*severity\s*:?\s*\**\s*(?:low|medium|high|critical|info|minor|major)\s*\**\s*$/i.test(line)
     );
 
+  // Inline code must be hidden before severity extraction and line filtering,
+  // which otherwise see a literal "Severity: High" line inside GitHub-rendered
+  // code as review metadata and delete it from the comment.
+  const prepareThreadComment = (comment: any): { severity: string | null; body: string } => {
+    const normalizedBody = (comment.body || "").replace(/\r\n/g, "\n");
+    const protectedCode = protectRenderedMultilineCode(normalizedBody, comment.body_html);
+    const severity = extractSeverity(proseOnly(protectedCode.masked));
+    const stripped = protectedCode.restore(
+      stripSeverityLine(stripSuggestionBlocks(protectedCode.masked))
+    );
+    return {
+      severity,
+      body: cleanCommentBody(stripped, undefined, comment.body_text, comment.body_html),
+    };
+  };
+
   // Render one inline review thread as clean Markdown: reviewer (+ severity),
   // file + anchor, a line-numbered ```diff code-context block, the comment
   // prose, then any suggested change as its own numbered ```diff changeset,
@@ -1856,7 +2208,8 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
     const rangeSize = sl && el ? el - sl + 1 : 1;
 
     const outdatedTag = thread.isOutdated && !resolved ? " _(outdated)_" : "";
-    const severity = extractSeverity(proseOnly(root.body || ""));
+    const rootComment = prepareThreadComment(root);
+    const severity = rootComment.severity;
     const severityTag = severity ? ` · Severity: ${severity}` : "";
     // A standalone thread card leads with its author — it IS the comment.
     // Inside a review card the UI shows a file/diff box with the commenter's
@@ -1885,7 +2238,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       blank();
     }
     const body = numberAnnotatedDiffFences(
-      cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(root.body || "")), undefined, root.body_text), fenceCtx,
+      rootComment.body, fenceCtx,
       { path: filePath, line: sl ?? el });
     if (body) { w(body); blank(); }
 
@@ -1912,12 +2265,13 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
     }
 
     for (const reply of thread.replies) {
-      const rSeverity = extractSeverity(proseOnly(reply.body || ""));
+      const replyComment = prepareThreadComment(reply);
+      const rSeverity = replyComment.severity;
       const rSeverityTag = rSeverity ? ` · Severity: ${rSeverity}` : "";
       w(`${actorEmoji(reply.user)} **${displayActor(reply.user)}** replied · ${formatDate(reply.created_at)}${rSeverityTag}`);
       blank();
       const rbody = numberAnnotatedDiffFences(
-        cleanCommentBody(stripSeverityLine(stripSuggestionBlocks(reply.body || "")), undefined, reply.body_text), fenceCtx,
+        replyComment.body, fenceCtx,
         { path: reply.path || filePath, line: (reply.start_line ?? reply.original_start_line ?? sl) ?? (reply.line ?? reply.original_line ?? el) });
       if (rbody) { w(rbody); blank(); }
       const rsl = reply.start_line ?? reply.original_start_line ?? sl;
@@ -1956,7 +2310,7 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
 
   // ── PR description (directly under the title, not labeled as a comment) ───────
   blank();
-  const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body, undefined, pr.body_text) : "";
+  const descClean = pr.body && pr.body.trim() ? cleanCommentBody(pr.body, undefined, pr.body_text, pr.body_html) : "";
   w(descClean || "_No description provided._");
 
   // ── PR information ───────────────────────────────────────────────────────────
@@ -2007,13 +2361,13 @@ export async function renderPR(data: PRData, options: PRRendererOptions): Promis
       // re-captioned exactly like a comment, so the render stays one visual
       // language.
       body = numberAnnotatedDiffFences(
-        cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`, c.body_text), fenceCtx);
+        cleanCommentBody(c.body || "", `${actorEmoji(c.user)} **${displayActor(c.user)}** · ${formatDate(c.created_at)}`, c.body_text, c.body_html), fenceCtx);
       if (!body) continue;
     } else if (card.kind === "review_event") {
       const r = card.data;
       header = `${actorEmoji(r.user)} **${displayActor(r.user)}** ${reviewVerb(r.state)} · ${formatDate(r.submitted_at || r.created_at)}`;
       body = numberAnnotatedDiffFences(
-        cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`, r.body_text), fenceCtx);
+        cleanCommentBody(r.body || "", `${actorEmoji(r.user)} **${displayActor(r.user)}** · ${formatDate(r.submitted_at || r.created_at)}`, r.body_text, r.body_html), fenceCtx);
       const verdict = String(r.state || "").toUpperCase();
       const hasVerdict = verdict === "CHANGES_REQUESTED" || verdict === "APPROVED" || verdict === "DISMISSED";
       if (!body && !hasVerdict && reviewThreads.length === 0) continue;
