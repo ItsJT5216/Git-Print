@@ -195,6 +195,24 @@ eq("attribute-bearing heading keeps its break",
   '<h3 id="s">Summary</h3>Body text here', '**Summary**\nBody text here');
 eq("attribute-bearing code keeps code formatting",
   '<code class="language-sh">npm test</code> first', '`npm test` first');
+eq("attribute-bearing code flattens unescaped Markdown ticks like GitHub does",
+  '<code class="language-js">const s = `hi`;</code>', '`const s = hi;`',
+  'const s = hi;',
+  '<p><code class="notranslate">const s = <code class="notranslate">hi</code>;</code></p>');
+eq("attribute-bearing code retains escaped visible backticks with a safe delimiter",
+  '<code class="language-js">const s = \\`hi\\`;</code>', '``const s = `hi`;``',
+  'const s = `hi`;',
+  '<p><code class="notranslate">const s = `hi`;</code></p>');
+eq("attribute-bearing code pads a visible leading backtick safely",
+  '<code class="x">\\`leading</code>', '`` `leading ``', '`leading',
+  '<p><code class="notranslate">`leading</code></p>');
+eq("attribute-bearing code pads a visible trailing backtick safely",
+  '<code class="x">trailing\\`</code>', '`` trailing` ``', 'trailing`',
+  '<p><code class="notranslate">trailing`</code></p>');
+eq("HTML code syntax shown inside a Markdown span stays literal",
+  'Example: `<code class="x">`', 'Example: `<code class="x">`',
+  'Example: <code class="x">',
+  '<p>Example: <code class="notranslate">&lt;code class="x"&gt;</code></p>');
 eq("invisible tag-only body becomes empty before card numbering",
   '<center>\n<img src="https://img.shields.io/badge/x.svg">\n</center>', '', '');
 eq("invisible wrapper is removed before whitespace tidy",
@@ -258,6 +276,66 @@ eq("comparison before a code span is not an HTML attribute",
   'When x < y, use `handlers[type](event)\n  .catch(log)`',
   'When x < y, use handlers[type](event) .catch(log)',
   '<p>When x &lt; y, use <code class="notranslate">handlers[type](event) .catch(log)</code></p>');
+eq("no-space comparison before code is not an HTML tag opener",
+  'When x<y, use `handlers[type](event)\n  .catch(log)`',
+  'When x<y, use `handlers[type](event)\n  .catch(log)`',
+  'When x<y, use handlers[type](event) .catch(log)',
+  '<p>When x&lt;y, use <code class="notranslate">handlers[type](event) .catch(log)</code></p>');
+eq("an earlier closed code span cannot fake an unfinished HTML tag",
+  'Example: `a <b` then `start\n  <span>[x](url)</span>\nend`',
+  'Example: `a <b` then `start\n  <span>[x](url)</span>\nend`',
+  'Example: a <b then start <span>[x](url)</span> end',
+  '<p>Example: <code class="notranslate">a &lt;b</code> then <code class="notranslate">start &lt;span&gt;[x](url)&lt;/span&gt; end</code></p>');
+eq("a literal pre example cannot exclude later confirmed code",
+  'Earlier `<pre>` then `x\n  <span>[y](url)</span>\nend` and later </pre>',
+  'Earlier `<pre>` then `x\n  <span>[y](url)</span>\nend` and later',
+  'Earlier <pre> then x <span>[y](url)</span> end and later',
+  '<p dir="auto">Earlier <code class="notranslate">&lt;pre&gt;</code> then <code class="notranslate">x &lt;span&gt;[y](url)&lt;/span&gt; end</code> and later </p>');
+eq("lazy blockquote continuation keeps its enclosing quote depth",
+  '> Intro\nUse `a\n> [x](url)`',
+  '> Intro\nUse `a\n> [x](url)`',
+  'Intro Use a [x](url)',
+  '<blockquote><p dir="auto">Intro<br>\nUse <code class="notranslate">a [x](url)</code></p></blockquote>');
+eq("nested lazy blockquote continuation keeps both quote markers",
+  '> > Intro\nUse `a\n> > [x](url)`',
+  '> > Intro\nUse `a\n> > [x](url)`',
+  'Intro Use a [x](url)',
+  '<blockquote>\n<blockquote>\n<p dir="auto">Intro<br>\nUse <code class="notranslate">a [x](url)</code></p>\n</blockquote>\n</blockquote>');
+eq("block interruption cannot consume a later heading-shaped code match",
+  'Fake: `start\n# [x](url)\nend`\n\nReal: `start\n    # [x](url)\nend`',
+  'Fake: `start\n# x\nend`\n\nReal: `start\n    # [x](url)\nend`',
+  'Fake: start x end Real: start # [x](url) end',
+  '<p dir="auto">Fake: `start</p>\n<h1 dir="auto"><a href="url">x</a></h1>\n<p dir="auto">end`</p>\n<p dir="auto">Real: <code class="notranslate">start # [x](url) end</code></p>');
+eq("block interruption cannot consume a later thematic-break code match",
+  'Fake: `start\n---\n[x](url)\nend`\n\nReal: `start\n    ---\n    [x](url)\n    end`',
+  'Fake: `start\n---\nx\nend`\n\nReal: `start\n    ---\n    [x](url)\n    end`',
+  'Fake: start x end Real: start --- [x](url) end',
+  '<h2 dir="auto">Fake: `start</h2>\n<p dir="auto"><a href="url">x</a><br>\nend`</p>\n<p dir="auto">Real: <code class="notranslate">start --- [x](url) end</code></p>');
+eq("block interruption cannot consume a later list-shaped code match",
+  'Fake: `start\n- [x](url)\nend`\n\nReal: `start\n    - [x](url)\n    end`',
+  'Fake: `start\n- x\nend`\n\nReal: `start\n    - [x](url)\n    end`',
+  'Fake: start x end Real: start - [x](url) end',
+  '<p dir="auto">Fake: `start</p>\n<ul dir="auto">\n<li><a href="url">x</a><br>\nend`</li>\n</ul>\n<p dir="auto">Real: <code class="notranslate">start - [x](url) end</code></p>');
+eq("block interruption cannot consume a later blockquote-shaped code match",
+  'Fake: `start\n> [x](url)\nend`\n\nReal: `start\n    > [x](url)\n    end`',
+  'Fake: `start\n> x\nend`\n\nReal: `start\n    > [x](url)\n    end`',
+  'Fake: start x end Real: start > [x](url) end',
+  '<p dir="auto">Fake: `start</p>\n<blockquote>\n<p dir="auto"><a href="url">x</a><br>\nend`</p>\n</blockquote>\n<p dir="auto">Real: <code class="notranslate">start &gt; [x](url) end</code></p>');
+eq("block interruption cannot consume code from a later fenced block match",
+  'Fake: `start\n```text\n[x](url)\n```\nend`\n\nReal: `start\n    ```text\n    [x](url)\n    ```\n    end`',
+  'Fake: `start\n```text\n[x](url)\n```\nend`\n\nReal: `start\n    ```text\n    [x](url)\n    ```\n    end`',
+  'Fake: start x end Real: start ```text [x](url) ``` end',
+  '<p dir="auto">Fake: `start</p>\n<pre lang="text" class="notranslate"><code class="notranslate">[x](url)\n</code></pre>\n<p dir="auto">end`</p>\n<p dir="auto">Real: <code class="notranslate">start ```text [x](url) ``` end</code></p>');
+eq("single-line code cannot consume a later multiline code occurrence",
+  'Use `x`\na [x](url) ` a [x](url)\n`',
+  'Use `x`\na x ` a [x](url)\n`',
+  'Use x a x a [x](url)',
+  '<p dir="auto">Use <code class="notranslate">x</code><br>\na <a href="url">x</a> <code class="notranslate">a [x](url)</code></p>');
+eq("a single-line span does not desynchronize the reported CodeRabbit example",
+  'Use `x` and `<div class="a">\n  y</div>` here',
+  'Use `x` and `<div class="a">\n  y</div>` here',
+  'Use x and <div class="a"> y</div> here',
+  '<p dir="auto">Use <code class="notranslate">x</code> and <code class="notranslate">&lt;div class="a"&gt; y&lt;/div&gt;</code> here</p>');
 eq("rendered double-backtick multiline span keeps link-shaped code",
   'Use ``a ` [x](url)\n  b`` here',
   'Use ``a ` [x](url)\n  b`` here',
