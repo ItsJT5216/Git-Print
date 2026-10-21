@@ -20,7 +20,7 @@
  */
 
 import { renderPR } from "../dist/pr-renderer.js";
-import { readFile, unlink } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -214,7 +214,8 @@ const data = {
 
 // ─── Run renderer ─────────────────────────────────────────────────────────────
 
-const outPath = join(tmpdir(), `pr20-fixture-${Date.now()}.md`);
+const tempDir = await mkdtemp(join(tmpdir(), "git-print-render-fixture-"));
+const outPath = join(tempDir, "review.md");
 await renderPR(data, {
   owner: "itstanner5216",
   repo: "zenith",
@@ -223,7 +224,6 @@ await renderPR(data, {
   outputPath: outPath,
 });
 const out = await readFile(outPath, "utf-8");
-await unlink(outPath).catch(() => {});
 
 // GitHub renders this whole multiline span as code. A metadata-looking line
 // inside it must remain in both a thread root and a reply, not migrate to a
@@ -239,13 +239,12 @@ const codeReply = {
   ...codeRoot, id: 302, in_reply_to_id: 301,
   created_at: "2026-06-07T10:00:01Z",
 };
-const codeOutPath = join(tmpdir(), `pr20-code-fixture-${Date.now()}.md`);
+const codeOutPath = join(tempDir, "code-review.md");
 await renderPR({ ...data, reviews: [], issueComments: [], reviewComments: [codeRoot, codeReply] }, {
   owner: "itstanner5216", repo: "zenith", pullNumber: 20,
   token: "dummy", outputPath: codeOutPath,
 });
 const codeOut = await readFile(codeOutPath, "utf-8");
-await unlink(codeOutPath).catch(() => {});
 
 // ─── Assertions ───────────────────────────────────────────────────────────────
 
@@ -356,6 +355,7 @@ check("severity-looking code is not promoted to thread metadata",
 // ─── Report ───────────────────────────────────────────────────────────────────
 
 const total = failures.length;
+await rm(tempDir, { recursive: true, force: true });
 if (total === 0) {
   console.log(`PASS — all assertions passed (${out.length} bytes rendered).`);
   process.exit(0);

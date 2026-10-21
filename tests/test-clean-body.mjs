@@ -38,6 +38,10 @@ eq("inline link unwraps to text",
   "Check [this guide](https://example.com/setup) for setup",
   "Check this guide for setup");
 
+eq("inline links retain labels with balanced URL parentheses",
+  "See [the guide](https://example.com/a_(b_(c))) today",
+  "See the guide today");
+
 eq("link text with code span unwraps",
   "See [`config_loader.ts`](https://github.com/x/y/blob/main/config_loader.ts) for details",
   "See `config_loader.ts` for details");
@@ -602,6 +606,9 @@ const stressHtml = Array.from({ length: stressSpanCount }, (_, index) =>
 ).join("\n");
 eq("many angle-bearing code spans stay indexed and faithful",
   stressMarkdown, stressMarkdown, undefined, stressHtml);
+const unterminatedImageTargets = "![x](".repeat(2000);
+eq("many unterminated image targets are preserved without regex backtracking",
+  unterminatedImageTargets, unterminatedImageTargets);
 
 // ─── Report ──────────────────────────────────────────────────────────────────
 

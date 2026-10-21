@@ -1442,6 +1442,20 @@ function normalizeVisibilityContext(text: string): string {
     .trim();
 }
 
+function stripHtmlComments(source: string): string {
+  const pieces: string[] = [];
+  let copied = 0;
+  while (copied < source.length) {
+    const start = source.indexOf("<!--", copied);
+    if (start < 0) break;
+    const close = source.indexOf("-->", start + 4);
+    pieces.push(source.slice(copied, start));
+    copied = close < 0 ? source.length : close + 3;
+  }
+  pieces.push(source.slice(copied));
+  return pieces.join("");
+}
+
 /**
  * Match a source tag to its location in GitHub's rendered text. Code examples
  * are excluded, and nearby text must agree on both sides, so an identical tag
@@ -1547,7 +1561,7 @@ function shieldRawHtmlBlocks(source: string):
       codeElements.push(code);
       return token;
     });
-    block = block.replace(/<!--([\s\S]*?)-->/g, "");
+    block = stripHtmlComments(block);
     block = block.replace(/[ \t]*<picture\b[^>]*>[\s\S]*?<\/picture\s*>/gi, "");
     block = replaceHtmlTagTokens(block, (tag) => /^<img\b/i.test(tag) ? "" : tag);
     for (let i = 0; i < codeElements.length; i++) {
@@ -2275,8 +2289,7 @@ function processDetailsBlocks(s: string, findingHeader?: string): string {
       const whole = match[0];
       const summaryHtml = match[1] || "";
       const content = match[2] || "";
-      const plain = summaryHtml
-        .replace(/<[^>]+>/g, " ")
+      const plain = stripRenderedHtmlTags(summaryHtml)
         .replace(/\\\./g, ".")
         .replace(/\s+/g, " ")
         .trim();
@@ -2516,6 +2529,50 @@ const LINK_DEF_LINE =
  *   - Bracket pairs without a matching definition (`arr[1][2]`, `[ERROR]: x`)
  *     — GitHub shows them literally, so we keep them literally.
  */
+function stripInlineLinkTargets(source: string): string {
+  const nextClosingBracket = new Int32Array(source.length);
+  let nextBracket = -1;
+  for (let i = source.length - 1; i >= 0; i--) {
+    if (source[i] === "]") nextBracket = i;
+    nextClosingBracket[i] = nextBracket;
+  }
+
+  const matchingParen = new Int32Array(source.length);
+  matchingParen.fill(-1);
+  const openParens: number[] = [];
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] === "(") openParens.push(i);
+    else if (source[i] === ")" && openParens.length > 0) {
+      matchingParen[openParens.pop()!] = i;
+    }
+  }
+
+  const pieces: string[] = [];
+  let copied = 0;
+  for (let i = 0; i < source.length;) {
+    const image = source[i] === "!" && source[i + 1] === "[";
+    if (source[i] !== "[" && !image) { i++; continue; }
+    const labelStart = i + (image ? 2 : 1);
+    const labelEnd = nextClosingBracket[labelStart] ?? -1;
+    if (labelEnd < labelStart || source[labelEnd + 1] !== "(") { i++; continue; }
+    const targetEnd = matchingParen[labelEnd + 1] ?? -1;
+    if (targetEnd < 0) { i++; continue; }
+
+    const label = source.slice(labelStart, labelEnd);
+    if (image || label.trim() === "") {
+      let removalStart = i;
+      while (removalStart > copied && /[ \t]/.test(source[removalStart - 1])) removalStart--;
+      pieces.push(source.slice(copied, removalStart));
+    } else {
+      pieces.push(source.slice(copied, i), label);
+    }
+    copied = targetEnd + 1;
+    i = copied;
+  }
+  pieces.push(source.slice(copied));
+  return pieces.join("");
+}
+
 function stripLinkDebris(body: string, shieldUnverifiedMultilineTags = true): string {
   // Pass 1 — collect defined reference labels (CommonMark matches labels
   // case-insensitively). Collected from prose only, so a definition-shaped
@@ -2530,10 +2587,9 @@ function stripLinkDebris(body: string, shieldUnverifiedMultilineTags = true): st
   return transformProse(body, (seg) => {
     let s = seg;
 
-    // Inline images first. (Running link-unwrap first would turn `![alt](url)`
-    // into `!alt`.) Leading whitespace is consumed so mid-sentence removal
-    // doesn't leave a double space.
-    s = s.replace(/[ \t]*!\[[^\]]*\]\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, "");
+    // Inline images and links use a forward scan with precomputed bracket and
+    // parenthesis matches to keep comment-controlled input linear.
+    s = stripInlineLinkTargets(s);
 
     // Reference-style images — removed only when their definition exists.
     s = s.replace(/[ \t]*!\[([^\]]*)\]\[([^\]]*)\]/g, (full: string, alt: string, ref: string) => {
@@ -2543,13 +2599,6 @@ function stripLinkDebris(body: string, shieldUnverifiedMultilineTags = true): st
 
     // Angle autolinks — `<https://…>` / `<http://…>` / `<mailto:…>`.
     s = s.replace(/[ \t]*<(?:https?|mailto):[^>\s]*>/gi, "");
-
-    // Empty-text links (the husk left where a badge image sat inside a link).
-    s = s.replace(/[ \t]*\[\s*\]\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, "");
-
-    // Inline links — keep the visible text, drop the target. Tolerates up to
-    // two levels of balanced parens inside the URL (wikipedia-style).
-    s = s.replace(/\[([^\]]*)\]\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, "$1");
 
     // Reference links — unwrap only when defined (`[text][ref]`, `[text][]`).
     s = s.replace(/\[([^\]]+)\]\[([^\]]*)\]/g, (full: string, text: string, ref: string) => {
