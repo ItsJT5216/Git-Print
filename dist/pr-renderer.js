@@ -12,6 +12,7 @@ import { writeFile, unlink } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join, basename, extname } from "node:path";
+import { HTML_NAMED_ENTITIES } from "./html-entities.js";
 // ─── API helpers ─────────────────────────────────────────────────────────────
 const API_BASE = "https://api.github.com";
 function createRateLimitState() {
@@ -993,7 +994,8 @@ function transformProse(s, transform, shieldUnverifiedMultilineTags = true) {
             tokenized = shieldMultilineCodeTags(tokenized, nonce, spans);
         }
         let out = transform(tokenized);
-        for (let j = 0; j < spans.length; j++) {
+        // Restore outer tokens first because their content may contain inner tokens.
+        for (let j = spans.length - 1; j >= 0; j--) {
             out = out.split(`${nonce}:${j}:`).join(spans[j]);
         }
         return out;
@@ -1035,18 +1037,24 @@ function maskedTransform(s, transform) {
 /** Decode the text of an inline <code> element in GitHub's rendered body. */
 function decodeRenderedCodeText(s) {
     const withoutTags = stripRenderedHtmlTags(s);
-    const decoded = withoutTags.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, value) => {
+    const decoded = decodeHtmlEntities(withoutTags);
+    return codeTextMatchKey(decoded);
+}
+/** Decode HTML5 named references and numeric references in rendered HTML text. */
+function decodeHtmlEntities(s) {
+    return s.replace(/&(#(?:[xX][0-9a-fA-F]+|\d+)|[A-Za-z][A-Za-z0-9]*);/g, (entity, value) => {
         if (value[0] === "#") {
             const codePoint = value[1].toLowerCase() === "x"
                 ? parseInt(value.slice(2), 16) : parseInt(value.slice(1), 10);
-            return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+            if (codePoint === 0 || codePoint > 0x10ffff ||
+                (codePoint >= 0xd800 && codePoint <= 0xdfff) ||
+                (codePoint >= 0x80 && codePoint <= 0x9f)) {
+                return "\ufffd";
+            }
+            return String.fromCodePoint(codePoint);
         }
-        const named = {
-            amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0",
-        };
-        return named[value.toLowerCase()] ?? entity;
+        return HTML_NAMED_ENTITIES[value] ?? entity;
     });
-    return codeTextMatchKey(decoded);
 }
 const CODE_LT = "\uE000";
 const CODE_GT = "\uE001";
@@ -1142,60 +1150,175 @@ function replaceHtmlTagTokens(source, replace) {
     pieces.push(source.slice(copied));
     return pieces.join("");
 }
-/** True when a source position is inside a paired Markdown backtick span. */
-function insideBacktickSpan(s, position) {
-    let delimiter = 0;
-    for (let i = 0; i < position;) {
-        if (s[i] !== "`") {
-            i++;
+const GFM_BLOCK_INTERRUPT = /^ {0,3}(?:<!--|<\?|<![A-Z]|<!\[CDATA\[|<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[ \t/>]|$)|<(?:pre|script|style|textarea)(?=[ \t>]|$)|`{3,}|~{3,}|#{1,6}(?=[ \t]|$)|>[ \t]?|(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$|=+[ \t]*$|-[ \t]*$|[-+*](?=[ \t]|$)|1[.)](?=[ \t]|$))/i;
+const QUOTE_MARKER = /^ {0,3}>[ \t]?/;
+function quotePrefix(line) {
+    let cursor = 0;
+    let depth = 0;
+    while (cursor < line.length) {
+        let marker = cursor;
+        let spaces = 0;
+        while (line[marker] === " " && spaces < 3) {
+            marker++;
+            spaces++;
+        }
+        if (line[marker] !== ">")
+            break;
+        depth++;
+        cursor = marker + 1;
+        if (line[cursor] === " " || line[cursor] === "\t")
+            cursor++;
+    }
+    return { depth, text: line.slice(cursor) };
+}
+/** Find complete Markdown code spans in one linear pass over paragraph lines. */
+function findMarkdownCodeSpans(source) {
+    const spans = [];
+    let active = null;
+    let fence = null;
+    let lineStart = 0;
+    while (lineStart <= source.length) {
+        let lineEnd = source.indexOf("\n", lineStart);
+        if (lineEnd < 0)
+            lineEnd = source.length;
+        const line = source.slice(lineStart, lineEnd);
+        const quote = quotePrefix(line);
+        if (fence) {
+            let indent = 0;
+            while (quote.text[indent] === " " && indent < 4)
+                indent++;
+            let markerEnd = indent;
+            while (quote.text[markerEnd] === fence.marker)
+                markerEnd++;
+            const closing = quote.depth === fence.quoteDepth && indent <= 3 &&
+                markerEnd - indent >= fence.width && !quote.text.slice(markerEnd).trim();
+            if (closing)
+                fence = null;
+            lineStart = lineEnd + 1;
+            if (lineEnd === source.length)
+                break;
             continue;
         }
-        const start = i;
-        while (s[i] === "`")
-            i++;
-        let slashes = 0;
-        for (let j = start - 1; j >= 0 && s[j] === "\\"; j--)
-            slashes++;
-        if (slashes % 2)
+        if (active) {
+            if (!line.trim()) {
+                active = null;
+            }
+            else {
+                const content = quote.depth >= active.quoteDepth ? quote.text : line;
+                if (quote.depth > active.quoteDepth ||
+                    (quote.depth >= active.quoteDepth && !quote.text.trim()) ||
+                    GFM_BLOCK_INTERRUPT.test(content)) {
+                    active = null;
+                }
+            }
+        }
+        const fenceStart = quote.text.match(/^ {0,3}(`{3,}|~{3,})/);
+        if (!active && fenceStart) {
+            fence = {
+                marker: fenceStart[1][0],
+                width: fenceStart[1].length,
+                quoteDepth: quote.depth,
+            };
+            lineStart = lineEnd + 1;
+            if (lineEnd === source.length)
+                break;
             continue;
-        const width = i - start;
-        if (delimiter === 0)
-            delimiter = width;
-        else if (delimiter === width)
-            delimiter = 0;
+        }
+        for (let i = lineStart; i < lineEnd;) {
+            if (source[i] !== "`") {
+                i++;
+                continue;
+            }
+            const runStart = i;
+            while (source[i] === "`")
+                i++;
+            const runEnd = i;
+            if (!active) {
+                let slashes = 0;
+                for (let j = runStart - 1; j >= lineStart && source[j] === "\\"; j--)
+                    slashes++;
+                const opener = runStart + (slashes % 2 ? 1 : 0);
+                const width = runEnd - opener;
+                if (width > 0)
+                    active = { start: opener, width, quoteDepth: quote.depth };
+            }
+            else if (runEnd - runStart === active.width) {
+                spans.push({ start: active.start, end: runEnd });
+                active = null;
+            }
+        }
+        lineStart = lineEnd + 1;
+        if (lineEnd === source.length)
+            break;
     }
-    return delimiter !== 0;
+    return spans;
 }
-/** Markdown inside an authored raw <code> element is still parsed by GitHub.
- * Remove delimiter runs while retaining escaped backticks that are visible
- * text. This keeps the cleaner from turning `\\`` into a missing character. */
+function insideMarkdownCodeSpan(spans, position) {
+    let lo = 0;
+    let hi = spans.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (spans[mid].start <= position)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    const span = spans[lo - 1];
+    return !!span && position < span.end;
+}
+/** True for ASCII punctuation that GitHub Markdown permits a backslash to escape. */
+function isMarkdownEscapablePunctuation(char) {
+    const code = char.charCodeAt(0);
+    return (code >= 0x21 && code <= 0x2f) ||
+        (code >= 0x3a && code <= 0x40) ||
+        (code >= 0x5b && code <= 0x60) ||
+        (code >= 0x7b && code <= 0x7e);
+}
+/** Flatten an authored raw <code> element to the text GitHub visibly renders. */
 function rawCodeElementText(source) {
-    let out = "";
+    const nonce = randomBytes(6).toString("hex");
+    const preserved = [];
+    let protectedSource = "";
+    const preserve = (text) => {
+        const token = nonce + ":" + preserved.length + ":";
+        preserved.push(text);
+        return token;
+    };
     for (let i = 0; i < source.length;) {
         if (source[i] === "\\") {
             const start = i;
             while (source[i] === "\\")
                 i++;
             const slashes = i - start;
+            protectedSource += "\\".repeat(Math.floor(slashes / 2));
             if (source[i] === "`") {
                 let end = i;
                 while (source[end] === "`")
                     end++;
                 const width = end - i;
-                out += "\\".repeat(Math.floor(slashes / 2));
                 if (slashes % 2) {
-                    out += "`".repeat(width);
+                    protectedSource += preserve("`".repeat(width));
                     i = end;
                 }
-                // With an even run the ticks are unescaped Markdown delimiters. Leave
-                // the cursor on them so the normal matching logic below can consume it.
+                // With an even run, the ticks remain Markdown delimiters.
                 continue;
             }
-            out += "\\".repeat(slashes);
+            if (i === source.length) {
+                if (slashes % 2)
+                    protectedSource += "\\";
+                continue;
+            }
+            if (slashes % 2 && isMarkdownEscapablePunctuation(source[i])) {
+                protectedSource += preserve(source[i++]);
+            }
+            else if (slashes % 2) {
+                // A backslash before a non-punctuation character is visible text.
+                protectedSource += "\\";
+            }
             continue;
         }
         if (source[i] !== "`") {
-            out += source[i++];
+            protectedSource += source[i++];
             continue;
         }
         const start = i;
@@ -1203,34 +1326,53 @@ function rawCodeElementText(source) {
             i++;
         const width = i - start;
         let close = -1;
+        const blankLine = /\n[ \t]*\n/g;
         for (let j = i; j < source.length;) {
             const next = source.indexOf("`", j);
             if (next < 0)
                 break;
+            blankLine.lastIndex = j;
+            const paragraphBreak = blankLine.exec(source);
+            if (paragraphBreak && paragraphBreak.index < next)
+                break;
             let end = next;
             while (source[end] === "`")
                 end++;
-            let slashes = 0;
-            for (let k = next - 1; k >= 0 && source[k] === "\\"; k--)
-                slashes++;
-            if (slashes % 2 === 0 && end - next === width) {
+            // Backslashes are literal inside an open code span, including before
+            // the closing delimiter.
+            if (end - next === width) {
                 close = next;
                 break;
             }
             j = end;
         }
         if (close < 0) {
-            out += "`".repeat(width);
+            protectedSource += "`".repeat(width);
             continue;
         }
         let inner = source.slice(i, close).replace(/\r\n?/g, "\n").replace(/\n/g, " ");
         if (inner.startsWith(" ") && inner.endsWith(" ") && inner.trim()) {
             inner = inner.slice(1, -1);
         }
-        out += inner;
+        protectedSource += preserve(inner);
         i = close + width;
     }
-    return out;
+    // GitHub renders source newlines and <br> tags as visible breaks. Preserve
+    // them as tokens so tag stripping and prose cleanup cannot merge the lines.
+    protectedSource = replaceHtmlTagTokens(protectedSource, (tag) => {
+        const next = tag[3];
+        return tag.slice(0, 3).toLowerCase() === "<br" &&
+            (next === ">" || next === "/" || /[\t\n\f\r ]/.test(next ?? ""))
+            ? preserve("\n") : tag;
+    });
+    protectedSource = protectedSource.replace(/\r\n?|\n/g, () => preserve("\n"));
+    let visible = stripRenderedHtmlTags(protectedSource)
+        .replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1");
+    visible = decodeHtmlEntities(visible);
+    for (let i = 0; i < preserved.length; i++) {
+        visible = visible.split(nonce + ":" + i + ":").join(preserved[i]);
+    }
+    return visible;
 }
 /** Make a Markdown code span whose delimiter cannot collide with its text. */
 function asMarkdownCodeSpan(text) {
@@ -1265,11 +1407,14 @@ function protectRenderedMultilineCode(s, renderedHtml) {
     }
     if (inlineCode.size === 0)
         return unchanged;
-    const excluded = [
+    const excludedMatches = [
         ...s.matchAll(/<pre\b[^>]*>[\s\S]*?<\/pre>/gi),
         ...s.matchAll(/```[\s\S]*?```/g),
         ...s.matchAll(/~~~[\s\S]*?~~~/g),
-    ].filter((m) => !insideBacktickSpan(s, m.index ?? 0))
+    ];
+    const markdownCodeSpans = findMarkdownCodeSpans(s);
+    const excluded = excludedMatches
+        .filter((m) => !insideMarkdownCodeSpan(markdownCodeSpans, m.index ?? 0))
         .map((m) => ({ start: m.index, end: m.index + m[0].length }));
     const insideExcluded = (pos) => excluded.some((range) => pos >= range.start && pos < range.end);
     const sourceCodeSpans = [];
@@ -1289,21 +1434,14 @@ function protectRenderedMultilineCode(s, renderedHtml) {
     // GFM block starts that can interrupt a paragraph. The HTML element list is
     // the GFM list (including <source>, excluding <output>); the other branches
     // cover headings, thematic breaks, lists, quotes, and fenced code.
-    const interruptsParagraph = /^ {0,3}(?:<!--|<\?|<![A-Z]|<!\[CDATA\[|<\/?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?=[ \t/>]|$)|<(?:pre|script|style|textarea)(?=[ \t>]|$)|`{3,}|~{3,}|#{1,6}(?=[ \t]|$)|>[ \t]?|(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})|[-+*](?=[ \t]|$)|1[.)](?=[ \t]|$))/i;
-    const quoteMarker = /^ {0,3}>[ \t]?/;
+    const interruptsParagraph = GFM_BLOCK_INTERRUPT;
     const lines = s.split("\n");
     const lineStarts = [0];
     for (let i = 0; i < s.length; i++)
         if (s[i] === "\n")
             lineStarts.push(i + 1);
     const quoteInfo = lines.map((line) => {
-        let text = line;
-        let explicitDepth = 0;
-        let marker;
-        while ((marker = quoteMarker.exec(text))) {
-            explicitDepth++;
-            text = text.slice(marker[0].length);
-        }
+        const { depth: explicitDepth, text } = quotePrefix(line);
         return { line, text, explicitDepth, effectiveDepth: 0 };
     });
     let lazyQuoteDepth = 0;
@@ -1336,7 +1474,7 @@ function protectRenderedMultilineCode(s, renderedHtml) {
     const stripQuoteDepth = (line, depth) => {
         let text = line;
         for (let q = 0; q < depth; q++) {
-            const marker = quoteMarker.exec(text);
+            const marker = QUOTE_MARKER.exec(text);
             if (!marker)
                 break;
             text = text.slice(marker[0].length);
@@ -1399,7 +1537,6 @@ function protectRenderedMultilineCode(s, renderedHtml) {
             i = close + width;
             continue;
         }
-        const lineStart = s.lastIndexOf("\n", start - 1) + 1;
         const openerLine = lineIndexAt(start);
         const depth = quoteInfo[openerLine]?.effectiveDepth ?? 0;
         const [first, ...rest] = content.split("\n");
@@ -1821,28 +1958,60 @@ function stripLinkDebris(body, shieldUnverifiedMultilineTags = true) {
  */
 export function cleanCommentBody(raw, findingHeader, renderedText, renderedHtml) {
     let s = (raw || "").replace(/\r\n/g, "\n");
+    const multilineCodeNonce = randomBytes(6).toString("hex");
+    const multilineCodeHtml = [];
     const protectedCode = protectRenderedMultilineCode(s, renderedHtml);
     s = protectedCode.masked;
     // With GitHub HTML available, the outer mask already protects confirmed
     // inline code. Do not shield tags in backtick pairs GitHub rendered as HTML.
     const transformCommentProse = (value, fn, convertRawCodeElements = false) => {
         let input = value;
+        const rawCodeNonce = randomBytes(6).toString("hex");
+        const rawCodeStash = [];
         if (convertRawCodeElements) {
             input = value.split(/(```[\s\S]*?```)/g).map((part, index) => {
                 if (index % 2 === 1)
                     return part;
+                const markdownCodeSpans = findMarkdownCodeSpans(part);
                 return part.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (match, inner, offset) => {
-                    if (insideBacktickSpan(part, offset))
+                    if (insideMarkdownCodeSpan(markdownCodeSpans, offset))
                         return match;
-                    const text = rawCodeElementText(inner)
-                        .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
-                        .replace(/\[((?:[^\[\]]|\[[^\]]*\])*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
-                        .trim();
-                    return text ? asMarkdownCodeSpan(text) : "";
+                    const text = rawCodeElementText(inner).trim();
+                    if (!text)
+                        return "";
+                    if (text.includes("\n")) {
+                        const escapeText = (line) => line
+                            .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                        const html = "<code>" + text.split("\n").map(escapeText).join("<br>") + "</code>";
+                        const token = multilineCodeNonce + ":html:" + multilineCodeHtml.length + ":";
+                        multilineCodeHtml.push(html);
+                        return token;
+                    }
+                    return asMarkdownCodeSpan(text);
                 });
             }).join("");
         }
-        return transformProse(input, fn, renderedHtml == null);
+        else {
+            // Prose-only cleanup must not edit raw HTML code content. That content is
+            // flattened to visible text at the dedicated HTML-to-Markdown pass below.
+            input = value.split(/(```[\s\S]*?```)/g).map((part, index) => {
+                if (index % 2 === 1)
+                    return part;
+                const markdownCodeSpans = findMarkdownCodeSpans(part);
+                return part.replace(/<code\b[^>]*>[\s\S]*?<\/code>/gi, (match, offset) => {
+                    if (insideMarkdownCodeSpan(markdownCodeSpans, offset))
+                        return match;
+                    const token = rawCodeNonce + ":" + rawCodeStash.length + ":";
+                    rawCodeStash.push(match);
+                    return token;
+                });
+            }).join("");
+        }
+        let output = transformProse(input, fn, renderedHtml == null);
+        for (let i = 0; i < rawCodeStash.length; i++) {
+            output = output.split(rawCodeNonce + ":" + i + ":").join(rawCodeStash[i]);
+        }
+        return output;
     };
     // HTML comments (bot metadata markers) — invisible on the rendered PR page.
     // Masked, not split: a multi-line comment may legitimately span a fence
@@ -1993,6 +2162,9 @@ export function cleanCommentBody(raw, findingHeader, renderedText, renderedHtml)
     // card is skipped rather than printed as a stray "---" or lone symbol.
     if (!/[\p{L}\p{N}]/u.test(s))
         return "";
+    for (let i = 0; i < multilineCodeHtml.length; i++) {
+        s = s.split(multilineCodeNonce + ":html:" + i + ":").join(multilineCodeHtml[i]);
+    }
     return protectedCode.restore(s);
 }
 // ═══════════════════════════════════════════════════════════════════════════════

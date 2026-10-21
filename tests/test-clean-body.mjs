@@ -195,6 +195,66 @@ eq("attribute-bearing heading keeps its break",
   '<h3 id="s">Summary</h3>Body text here', '**Summary**\nBody text here');
 eq("attribute-bearing code keeps code formatting",
   '<code class="language-sh">npm test</code> first', '`npm test` first');
+eq("prose newline cleanup leaves literal backslash-n in authored code",
+  'Remove unused <code>const lineStart = s.lastIndexOf("\\n", start - 1) + 1;</code>.',
+  'Remove unused `const lineStart = s.lastIndexOf("\\n", start - 1) + 1;`.',
+  'Remove unused const lineStart = s.lastIndexOf("\\n", start - 1) + 1;.',
+  '<p>Remove unused <code class="notranslate">const lineStart = s.lastIndexOf("\\n", start - 1) + 1;</code>.</p>');
+eq("unmatched backtick in a prior paragraph does not hide HTML code",
+  "An unmatched ` tick.\n\nUse <code class=\"x\">npm test</code>.",
+  "An unmatched ` tick.\n\nUse `npm test`.",
+  "An unmatched ` tick.\n\nUse npm test.",
+  '<p>An unmatched ` tick.</p>\n<p>Use <code class="notranslate">npm test</code>.</p>');
+eq("unmatched backtick does not cross an ATX heading before HTML code",
+  'An unmatched ` tick.\n# Heading\nUse <code class="x">npm test</code>.',
+  'An unmatched ` tick.\n# Heading\nUse `npm test`.',
+  'An unmatched ` tick.\nHeading\nUse npm test.',
+  '<p>An unmatched ` tick.</p>\n<h1>Heading</h1>\n<p>Use <code class="notranslate">npm test</code>.</p>');
+eq("backslash before a code-span closer remains literal",
+  "<code>&lt;code&gt;`C:\\`&lt;/code&gt;</code>",
+  "`<code>C:\\</code>`",
+  "<code>C:\\</code>",
+  '<p><code class="notranslate">&lt;code&gt;<code class="notranslate">C:\\</code>&lt;/code&gt;</code></p>');
+eq("authored code flattens nested HTML and decodes visible entities",
+  '<code class="x">foo <em>bar</em> &lt; b &amp;&amp; c</code>',
+  '`foo bar < b && c`',
+  'foo bar < b && c',
+  '<p><code class="notranslate">foo <em>bar</em> &lt; b &amp;&amp; c</code></p>');
+eq("authored code decodes GitHub's named HTML5 entities",
+  '<code class="x">&copy; &mdash; &hellip; &eacute; &trade; &nbsp; &Tab; &#x1F680;</code>',
+  '`© — … é ™   \t 🚀`',
+  '© — … é ™   \t 🚀',
+  '<p><code class="notranslate">© — … é ™   \t 🚀</code></p>');
+eq("authored code applies Markdown escapes before decoding entities",
+  '<code class="x">\\*bold\\* \\&amp;</code>',
+  '`*bold* &amp;`',
+  '*bold* &amp;',
+  '<p><code class="notranslate">*bold* &amp;amp;</code></p>');
+eq("authored code keeps explicit HTML line breaks",
+  '<code class="x">foo<br>bar</code>',
+  '<code>foo<br>bar</code>',
+  'foo\nbar',
+  '<p><code class="notranslate">foo<br>bar</code></p>');
+eq("authored code keeps line breaks rendered from source newlines",
+  '<code class="x">foo\nbar</code>',
+  '<code>foo<br>bar</code>',
+  'foo\nbar',
+  '<p><code class="notranslate">foo<br>\nbar</code></p>');
+eq("authored code matches GitHub replacement for invalid numeric references",
+  '<code class="x">x &#0; &#xD800; &#x110000; &#128; &#129; y</code>',
+  '`x � � � � � y`',
+  'x � � � � � y',
+  '<p><code class="notranslate">x � � � � � y</code></p>');
+eq("nested Markdown code keeps its literal HTML spelling",
+  '<code class="x">foo `<em>bar</em>`</code>',
+  '`foo <em>bar</em>`',
+  'foo <em>bar</em>',
+  '<p><code class="notranslate">foo <code class="notranslate">&lt;em&gt;bar&lt;/em&gt;</code></code></p>');
+eq("nested Markdown code keeps entity spellings",
+  '<code class="x">foo `&lt;em&gt;bar&lt;/em&gt;`</code>',
+  '`foo &lt;em&gt;bar&lt;/em&gt;`',
+  'foo &lt;em&gt;bar&lt;/em&gt;',
+  '<p><code class="notranslate">foo <code class="notranslate">&amp;lt;em&amp;gt;bar&amp;lt;/em&amp;gt;</code></code></p>');
 eq("attribute-bearing code flattens unescaped Markdown ticks like GitHub does",
   '<code class="language-js">const s = `hi`;</code>', '`const s = hi;`',
   'const s = hi;',
@@ -317,6 +377,16 @@ eq("block interruption cannot consume a later heading-shaped code match",
   'Fake: `start\n# x\nend`\n\nReal: `start\n    # [x](url)\nend`',
   'Fake: start x end Real: start # [x](url) end',
   '<p dir="auto">Fake: `start</p>\n<h1 dir="auto"><a href="url">x</a></h1>\n<p dir="auto">end`</p>\n<p dir="auto">Real: <code class="notranslate">start # [x](url) end</code></p>');
+eq("thematic-break prefixes do not interrupt rendered multiline code",
+  'Use `start\n---flag [x](url)\nend` here',
+  'Use `start\n---flag [x](url)\nend` here',
+  'Use start ---flag [x](url) end here',
+  '<p>Use <code class="notranslate">start ---flag [x](url) end</code> here</p>');
+eq("setext heading boundary cannot consume a later real code match",
+  'Fake: `start\n===\n[x](url)\nend`\n\nReal: `start\n    ===\n    [x](url)\n    end`',
+  'Fake: `start\n===\nx\nend`\n\nReal: `start\n    ===\n    [x](url)\n    end`',
+  'Fake: `start\n===\nx\nend` Real: start === [x](url) end',
+  '<h1>Fake: `start</h1>\n<p><a href="url">x</a><br>\nend`</p>\n<p>Real: <code class="notranslate">start === [x](url) end</code></p>');
 eq("block interruption cannot consume a later thematic-break code match",
   'Fake: `start\n---\n[x](url)\nend`\n\nReal: `start\n    ---\n    [x](url)\n    end`',
   'Fake: `start\n---\nx\nend`\n\nReal: `start\n    ---\n    [x](url)\n    end`',
@@ -451,6 +521,10 @@ for (const bad of adversarial) {
     failures.push({ name: "adversarial must not throw", input: String(bad), expected: "no throw", got: e.message });
   }
 }
+
+eq("nested tokens in multiline code tags are restored from the outside in",
+  'Use ``start\n<div data-x="`value`">\nend`` here',
+  'Use ``start\n<div data-x="`value`">\nend`` here');
 
 // ─── Report ──────────────────────────────────────────────────────────────────
 
