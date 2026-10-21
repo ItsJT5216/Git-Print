@@ -195,6 +195,12 @@ eq("attribute-bearing heading keeps its break",
   '<h3 id="s">Summary</h3>Body text here', '**Summary**\nBody text here');
 eq("attribute-bearing code keeps code formatting",
   '<code class="language-sh">npm test</code> first', '`npm test` first');
+eq("quoted greater-than signs do not leak code-tag attributes",
+  '<code title="a > b">hello</code>', '`hello`', 'hello',
+  '<p><code title="a &gt; b">hello</code></p>');
+eq("quoted greater-than signs inside nested code markup are stripped whole",
+  '<code>foo <span title="a > b">bar</span></code>', '`foo bar`', 'foo bar',
+  '<p><code>foo <span title="a &gt; b">bar</span></code></p>');
 eq("prose newline cleanup leaves literal backslash-n in authored code",
   'Remove unused <code>const lineStart = s.lastIndexOf("\\n", start - 1) + 1;</code>.',
   'Remove unused `const lineStart = s.lastIndexOf("\\n", start - 1) + 1;`.',
@@ -210,6 +216,21 @@ eq("unmatched backtick does not cross an ATX heading before HTML code",
   'An unmatched ` tick.\n# Heading\nUse `npm test`.',
   'An unmatched ` tick.\nHeading\nUse npm test.',
   '<p>An unmatched ` tick.</p>\n<h1>Heading</h1>\n<p>Use <code class="notranslate">npm test</code>.</p>');
+eq("only the first escaped tick in a delimiter run is literal",
+  'Use \\``<b>literal</b>` after',
+  'Use \\``<b>literal</b>` after',
+  'Use `<b>literal</b> after',
+  '<p>Use `<code class="notranslate">&lt;b&gt;literal&lt;/b&gt;</code> after</p>');
+eq("backslash-escaped raw tags remain visible text",
+  'Use \\<center>literal',
+  'Use \\<center>literal',
+  'Use <center>literal',
+  '<p>Use &lt;center&gt;literal</p>');
+eq("quoted greater-than signs do not end an HTML tag early",
+  '<x-wrap title="a > b">Hello</x-wrap>',
+  'Hello',
+  'Hello',
+  '<p>Hello</p>');
 eq("backslash before a code-span closer remains literal",
   "<code>&lt;code&gt;`C:\\`&lt;/code&gt;</code>",
   "`<code>C:\\</code>`",
@@ -225,6 +246,11 @@ eq("authored code decodes GitHub's named HTML5 entities",
   '`© — … é ™   \t 🚀`',
   '© — … é ™   \t 🚀',
   '<p><code class="notranslate">© — … é ™   \t 🚀</code></p>');
+eq("unknown named entities do not resolve through object prototypes",
+  '<code class="x">&constructor; &toString;</code>',
+  '`&constructor; &toString;`',
+  '&constructor; &toString;',
+  '<p><code class="notranslate">&amp;constructor; &amp;toString;</code></p>');
 eq("authored code applies Markdown escapes before decoding entities",
   '<code class="x">\\*bold\\* \\&amp;</code>',
   '`*bold* &amp;`',
@@ -240,6 +266,16 @@ eq("authored code keeps line breaks rendered from source newlines",
   '<code>foo<br>bar</code>',
   'foo\nbar',
   '<p><code class="notranslate">foo<br>\nbar</code></p>');
+eq("multiline authored code encodes ticks before reinserting HTML",
+  '<code class="x">line one\nvalue ``</code>',
+  '<code>line one<br>value &#96;&#96;</code>',
+  'line one\nvalue ``',
+  '<p><code class="notranslate">line one<br>\nvalue ``</code></p>');
+eq("multiline authored code encodes Markdown punctuation before reinserting HTML",
+  '<code>line one\nvalue \\`\\`</code>',
+  '<code>line one<br>value &#96;&#96;</code>',
+  'line one\nvalue ``',
+  '<p><code>line one\nvalue ``</code></p>');
 eq("authored code matches GitHub replacement for invalid numeric references",
   '<code class="x">x &#0; &#xD800; &#x110000; &#128; &#129; y</code>',
   '`x � � � � � y`',
@@ -282,6 +318,16 @@ eq("GitHub-visible script-looking text stays inert in Markdown",
   'Raw &lt;script&gt;value&lt;/script&gt; text',
   'Raw <script>value</script> text',
   '<p dir="auto">Raw &lt;script&gt;value&lt;/script&gt; text</p>');
+eq("invisible HTML markup is not kept because the same tag appears only in a code block",
+  '<center>hello</center>\n\n```html\n<center>\n```',
+  'hello\n\n```html\n<center>\n```',
+  'hello\n<center>',
+  'hello\n<div class="highlight highlight-text-html-basic"><pre><span class="pl-kos">&lt;</span><span class="pl-ent">center</span><span class="pl-kos">&gt;</span></pre></div>');
+eq("invisible wrapper is not matched to a later identical literal entity",
+  '<center>hello</center> and &lt;center&gt;',
+  'hello and &lt;center&gt;',
+  'hello and <center>',
+  'hello and &lt;center&gt;');
 
 // body_html values below reflect the GitHub GFM rendering API. It is already
 // returned by the full+json REST calls used by git-print; no live test network
@@ -372,11 +418,31 @@ eq("nested lazy blockquote continuation keeps both quote markers",
   '> > Intro\nUse `a\n> > [x](url)`',
   'Intro Use a [x](url)',
   '<blockquote>\n<blockquote>\n<p dir="auto">Intro<br>\nUse <code class="notranslate">a [x](url)</code></p>\n</blockquote>\n</blockquote>');
+eq("partial explicit quote depth keeps nested lazy code confirmed by GitHub",
+  '> > Intro\nUse `a\n> [x](url)`',
+  '> > Intro\nUse `a\n> [x](url)`',
+  'Intro Use a [x](url)',
+  '<blockquote>\n<blockquote>\n<p>Intro\nUse <code>a [x](url)</code></p>\n</blockquote>\n</blockquote>');
 eq("block interruption cannot consume a later heading-shaped code match",
   'Fake: `start\n# [x](url)\nend`\n\nReal: `start\n    # [x](url)\nend`',
   'Fake: `start\n# x\nend`\n\nReal: `start\n    # [x](url)\nend`',
   'Fake: start x end Real: start # [x](url) end',
   '<p dir="auto">Fake: `start</p>\n<h1 dir="auto"><a href="url">x</a></h1>\n<p dir="auto">end`</p>\n<p dir="auto">Real: <code class="notranslate">start # [x](url) end</code></p>');
+eq("raw HTML block text cannot consume a later rendered code match",
+  '<div>Fake: `start\n[x](url)\nend`</div>\n\nReal: `start\n[x](url)\nend`',
+  '<div>Fake: `start\n[x](url)\nend`</div>\n\nReal: `start\n[x](url)\nend`',
+  'Fake: `start\n[x](url)\nend` Real: start [x](url) end',
+  '<div>Fake: `start\n[x](url)\nend`</div>\n<p>Real: <code class="notranslate">start [x](url) end</code></p>');
+eq("images inside preserved raw HTML blocks stay omitted",
+  '<div>Visible [x](url) <img src="badge.png"></div>',
+  '<div>Visible [x](url) </div>',
+  'Visible [x](url)',
+  '<div>Visible [x](url) <img src="badge.png"></div>');
+eq("inline tilde runs do not exclude a confirmed multiline code span",
+  'Prefix ~~~ foo `start\n[x](url)\nend` bar ~~~ suffix',
+  'Prefix ~~~ foo `start\n[x](url)\nend` bar ~~~ suffix',
+  'Prefix ~~~ foo start [x](url) end bar ~~~ suffix',
+  '<p>Prefix ~~~ foo <code>start [x](url) end</code> bar ~~~ suffix</p>');
 eq("thematic-break prefixes do not interrupt rendered multiline code",
   'Use `start\n---flag [x](url)\nend` here',
   'Use `start\n---flag [x](url)\nend` here',
@@ -525,6 +591,17 @@ for (const bad of adversarial) {
 eq("nested tokens in multiline code tags are restored from the outside in",
   'Use ``start\n<div data-x="`value`">\nend`` here',
   'Use ``start\n<div data-x="`value`">\nend`` here');
+
+const stressSpanCount = 240;
+const stressMarkdown = Array.from({ length: stressSpanCount }, (_, index) =>
+  "Use `start\n  <span>[item-" + index + "](url)</span>\nend`"
+).join("\n\n");
+const stressHtml = Array.from({ length: stressSpanCount }, (_, index) =>
+  '<p>Use <code class="notranslate">start &lt;span&gt;[item-' +
+  index + '](url)&lt;/span&gt; end</code></p>'
+).join("\n");
+eq("many angle-bearing code spans stay indexed and faithful",
+  stressMarkdown, stressMarkdown, undefined, stressHtml);
 
 // ─── Report ──────────────────────────────────────────────────────────────────
 
