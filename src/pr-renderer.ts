@@ -1163,6 +1163,53 @@ function tokenizeInlineCodeSpans(
   return out;
 }
 
+/** Protect HTML-looking tokens inside complete multiline backtick spans. */
+function shieldMultilineCodeTags(
+  prose: string, nonce: string, spans: string[]
+): string {
+  const parts: string[] = [];
+  let copied = 0;
+  for (let i = 0; i < prose.length;) {
+    if (prose[i] !== "`") { i++; continue; }
+    const start = i;
+    while (prose[i] === "`") i++;
+    let slashes = 0;
+    for (let j = start - 1; j >= 0 && prose[j] === "\\"; j--) slashes++;
+    if (slashes % 2) continue;
+    const width = i - start;
+    let close = -1;
+    for (let j = i; j < prose.length;) {
+      const next = prose.indexOf("`", j);
+      const blankLine = prose.indexOf("\n\n", j);
+      if (next < 0 || (blankLine >= 0 && blankLine < next)) break;
+      let end = next;
+      while (prose[end] === "`") end++;
+      if (end - next === width) { close = next; break; }
+      j = end;
+    }
+    if (close < 0) continue;
+    const content = prose.slice(i, close);
+    if (!content.includes("\n") || content.includes("\n\n")) {
+      i = close + width;
+      continue;
+    }
+    const protectedContent = replaceHtmlTagTokens(content, (tag) => {
+      const token = `${nonce}:${spans.length}:`;
+      spans.push(tag);
+      return token;
+    });
+    if (protectedContent !== content) {
+      const end = close + width;
+      parts.push(prose.slice(copied, start), prose.slice(start, i), protectedContent, prose.slice(close, end));
+      copied = end;
+    }
+    i = close + width;
+  }
+  if (copied === 0) return prose;
+  parts.push(prose.slice(copied));
+  return parts.join("");
+}
+
 /**
  * Run `transform` on prose while preserving fences and complete inline code
  * spans byte-for-byte. A nonce token keeps surrounding prose contiguous so
@@ -1184,17 +1231,10 @@ function transformProse(
       // consumed would break restoration — deleting the code span and leaking
       // token text. Plain hex with colons survives every pass untouched.
       let tokenized = tokenizeInlineCodeSpans(part, nonce, spans);
-      // A multiline single-backtick span is otherwise left on the existing
-      // prose path. Shield only literal tag tokens inside it so HTML cleanup
-      // cannot delete source code the GitHub UI visibly renders.
+      // Multiline spans without rendered HTML are on the legacy prose path.
+      // Shield their literal tags so HTML cleanup cannot delete code text.
       if (shieldUnverifiedMultilineTags) {
-        tokenized = tokenized.replace(/`[^`\n]*(?:\n(?!\n)[^`\n]*)+`/g, (m) =>
-          m.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*?)?\s*\/?>/g, (tag) => {
-            const token = `${nonce}:${spans.length}:`;
-            spans.push(tag);
-            return token;
-          })
-        );
+        tokenized = shieldMultilineCodeTags(tokenized, nonce, spans);
       }
       let out = transform(tokenized);
       for (let j = 0; j < spans.length; j++) {
@@ -1240,7 +1280,8 @@ function maskedTransform(s: string, transform: (masked: string) => string): stri
 
 /** Decode the text of an inline <code> element in GitHub's rendered body. */
 function decodeRenderedCodeText(s: string): string {
-  return s.replace(/<[^>]*>/g, "").replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi,
+  const withoutTags = stripRenderedHtmlTags(s);
+  const decoded = withoutTags.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi,
     (entity, value: string) => {
       if (value[0] === "#") {
         const codePoint = value[1].toLowerCase() === "x"
@@ -1252,6 +1293,81 @@ function decodeRenderedCodeText(s: string): string {
       };
       return named[value.toLowerCase()] ?? entity;
     });
+  return codeTextMatchKey(decoded);
+}
+
+const CODE_LT = "\uE000";
+const CODE_GT = "\uE001";
+
+/** Angle-bracket keying keeps extracted code text out of an HTML context. */
+function codeTextMatchKey(text: string): string {
+  return text.replace(/[<>\uE000\uE001]/g, (char) => {
+    if (char === "<") return CODE_LT;
+    if (char === ">") return CODE_GT;
+    return char + char;
+  });
+}
+
+/** Strip complete HTML tag tokens in one pass; malformed '<' text is retained. */
+function stripRenderedHtmlTags(source: string): string {
+  const pieces: string[] = [];
+  let copied = 0;
+  for (let i = 0; i < source.length;) {
+    if (source[i] !== "<") { i++; continue; }
+    let name = i + 1;
+    if (source[name] === "/") name++;
+    if (!/[A-Za-z]/.test(source[name] ?? "")) { i++; continue; }
+    name++;
+    while (/[A-Za-z0-9:-]/.test(source[name] ?? "")) name++;
+    if (source[name] !== ">" && source[name] !== "/" && !/[\t\n\f\r ]/.test(source[name] ?? "")) {
+      i++;
+      continue;
+    }
+    let end = name;
+    while (end < source.length && source[end] !== ">" && source[end] !== "<") end++;
+    if (source[end] === ">") {
+      pieces.push(source.slice(copied, i));
+      copied = end + 1;
+      i = end + 1;
+    } else if (source[end] === "<") {
+      i = end;
+    } else {
+      i = source.length;
+    }
+  }
+  pieces.push(source.slice(copied));
+  return pieces.join("");
+}
+
+/** Replace HTML tag tokens without regex backtracking on comment-controlled text. */
+function replaceHtmlTagTokens(source: string, replace: (tag: string) => string): string {
+  const pieces: string[] = [];
+  let copied = 0;
+  for (let i = 0; i < source.length;) {
+    if (source[i] !== "<") { i++; continue; }
+    let name = i + 1;
+    if (source[name] === "/") name++;
+    if (!/[A-Za-z]/.test(source[name] ?? "")) { i++; continue; }
+    name++;
+    while (/[A-Za-z0-9:-]/.test(source[name] ?? "")) name++;
+    if (source[name] !== ">" && source[name] !== "/" && !/[\t\n\f\r ]/.test(source[name] ?? "")) {
+      i++;
+      continue;
+    }
+    let end = name;
+    while (end < source.length && source[end] !== ">" && source[end] !== "<") end++;
+    if (source[end] === ">") {
+      pieces.push(source.slice(copied, i), replace(source.slice(i, end + 1)));
+      copied = end + 1;
+      i = end + 1;
+    } else if (source[end] === "<") {
+      i = end;
+    } else {
+      i = source.length;
+    }
+  }
+  pieces.push(source.slice(copied));
+  return pieces.join("");
 }
 
 /** True when a source position is inside a paired Markdown backtick span. */
@@ -1502,7 +1618,7 @@ function protectRenderedMultilineCode(s: string, renderedHtml?: string | null):
       continue;
     }
     sourceCodeSpans.push({ start, end: close + width });
-    const remaining = inlineCode.get(visible) ?? 0;
+    const remaining = inlineCode.get(codeTextMatchKey(visible)) ?? 0;
     if (remaining === 0) {
       i = close + width;
       continue;
@@ -2069,8 +2185,9 @@ export function cleanCommentBody(
   // this before tidying and the empty-body guard so a tag-only card vanishes.
   if (renderedText != null) {
     s = transformCommentProse(s, (seg) =>
-      seg.replace(/<\/?[A-Za-z][A-Za-z0-9:-]*(?:\s[^<>]*)?\/?>/g,
-        (tag) => renderedText.includes(tag) ? tag : "")
+      replaceHtmlTagTokens(seg, (tag) => renderedText.includes(tag)
+        ? tag.replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        : "")
     );
   }
 

@@ -217,6 +217,11 @@ eq("invisible tag-only body becomes empty before card numbering",
   '<center>\n<img src="https://img.shields.io/badge/x.svg">\n</center>', '', '');
 eq("invisible wrapper is removed before whitespace tidy",
   '<x-wrap>\nHello there\n</x-wrap>', 'Hello there', 'Hello there');
+eq("GitHub-visible script-looking text stays inert in Markdown",
+  'Raw <script>value</script> text',
+  'Raw &lt;script&gt;value&lt;/script&gt; text',
+  'Raw <script>value</script> text',
+  '<p dir="auto">Raw &lt;script&gt;value&lt;/script&gt; text</p>');
 
 // body_html values below reflect the GitHub GFM rendering API. It is already
 // returned by the full+json REST calls used by git-print; no live test network
@@ -231,6 +236,12 @@ eq("rendered multiline code keeps link-shaped source",
   'Call `handlers[type](event)\n  .catch(log)` instead',
   'Call handlers[type](event) .catch(log) instead',
   '<p>Call <code class="notranslate">handlers[type](event) .catch(log)</code> instead</p>');
+const repeatedAngles = "<".repeat(256);
+eq("angle-heavy rendered code remains matched without interpreting tags",
+  `Use \`start\n  ${repeatedAngles}[x](url)\nend\``,
+  `Use \`start\n  ${repeatedAngles}[x](url)\nend\``,
+  `Use start ${repeatedAngles}[x](url) end`,
+  `<p>Use <code class="notranslate">start ${"&lt;".repeat(256)}[x](url) end</code></p>`);
 eq("rendered multiline code keeps literal HTML-comment syntax",
   'Template: `\n    <!-- keep me -->\n    <div>x</div>`',
   'Template: `\n    <!-- keep me -->\n    <div>x</div>`',
@@ -336,6 +347,10 @@ eq("a single-line span does not desynchronize the reported CodeRabbit example",
   'Use `x` and `<div class="a">\n  y</div>` here',
   'Use x and <div class="a"> y</div> here',
   '<p dir="auto">Use <code class="notranslate">x</code> and <code class="notranslate">&lt;div class="a"&gt; y&lt;/div&gt;</code> here</p>');
+const malformedTagRun = `<A ${" ".repeat(256)}${"<".repeat(256)}`;
+eq("malformed tag-like text in a multiline span stays literal",
+  `Before \`start\n  ${malformedTagRun}\nend\` after`,
+  `Before \`start\n  ${malformedTagRun}\nend\` after`);
 eq("rendered double-backtick multiline span keeps link-shaped code",
   'Use ``a ` [x](url)\n  b`` here',
   'Use ``a ` [x](url)\n  b`` here',
