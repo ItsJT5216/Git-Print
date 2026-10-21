@@ -228,7 +228,8 @@ await unlink(outPath).catch(() => {});
 // GitHub renders this whole multiline span as code. A metadata-looking line
 // inside it must remain in both a thread root and a reply, not migrate to a
 // severity label or disappear before cleanCommentBody can protect it.
-const codeBody = 'Code: `start\nSeverity: High\nend`';
+const codeBody = 'Code: `start\r\nSeverity: High\r\nend`';
+const normalizedCodeBody = 'Code: `start\nSeverity: High\nend`';
 const codeHtml = '<p>Code: <code class="notranslate">start Severity: High end</code></p>';
 const codeRoot = {
   ...data.reviewComments[0], id: 301, in_reply_to_id: null,
@@ -348,7 +349,7 @@ check("no triple newlines outside fences",
   out.split(/```[\s\S]*?```/g).every((seg) => !seg.includes("\n\n\n")));
 check("single H1", (out.match(/^# /gm) || []).length === 1);
 check("severity-looking code survives in root and reply",
-  codeOut.split(codeBody).length - 1 === 2);
+  codeOut.split(normalizedCodeBody).length - 1 === 2);
 check("severity-looking code is not promoted to thread metadata",
   !codeOut.includes("· Severity: High"));
 
