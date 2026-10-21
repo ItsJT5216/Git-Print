@@ -58,6 +58,10 @@ eq("empty link removed",
   "Badge husk [](https://shield.example.com) gone",
   "Badge husk gone");
 
+eq("linked badge images are removed through the outer link",
+  "[![coverage](https://img.example/coverage.svg)](https://img.example/project)",
+  "");
+
 eq("reference link unwraps when defined",
   "See [docs][1] and [api][2] here\n\n[1]: https://docs.example.com\n[2]: https://api.example.com",
   "See docs and api here");
@@ -170,6 +174,12 @@ eq("html comment removed, code example showing one kept",
 eq("details boilerplate removed",
   "Keep this.\n<details><summary>Tips</summary>Promo body</details>",
   "Keep this.");
+eq("details furniture split by a break tag is still removed",
+  "Keep this.\n<details><summary>Review<br>info</summary>Promo body</details>",
+  "Keep this.");
+eq("content-bearing details summaries preserve break spacing",
+  "<details><summary>Review<br>notes</summary>Useful body.</details>",
+  "**Review notes**\n\nUseful body.");
 
 eq("anchor tag unwrapped to text",
   "See <a href=\"https://x.com/profile\">the docs</a> here",
@@ -199,12 +209,20 @@ eq("attribute-bearing heading keeps its break",
   '<h3 id="s">Summary</h3>Body text here', '**Summary**\nBody text here');
 eq("attribute-bearing code keeps code formatting",
   '<code class="language-sh">npm test</code> first', '`npm test` first');
+eq("raw code preserves separating whitespace outside the generated code span",
+  'a<code class="x"> b </code>c', 'a `b` c', 'a b c',
+  '<p>a<code class="x"> b </code>c</p>');
 eq("quoted greater-than signs do not leak code-tag attributes",
   '<code title="a > b">hello</code>', '`hello`', 'hello',
   '<p><code title="a &gt; b">hello</code></p>');
 eq("quoted greater-than signs inside nested code markup are stripped whole",
   '<code>foo <span title="a > b">bar</span></code>', '`foo bar`', 'foo bar',
   '<p><code>foo <span title="a &gt; b">bar</span></code></p>');
+eq("closing code tags inside Markdown code spans stay literal",
+  '<code class="x">Show ``</code>`` end</code>',
+  '`Show </code> end`',
+  'Show </code> end',
+  '<p><code>Show <code>&lt;/code&gt;</code> end</code></p>');
 eq("prose newline cleanup leaves literal backslash-n in authored code",
   'Remove unused <code>const lineStart = s.lastIndexOf("\\n", start - 1) + 1;</code>.',
   'Remove unused `const lineStart = s.lastIndexOf("\\n", start - 1) + 1;`.',
@@ -220,6 +238,11 @@ eq("unmatched backtick does not cross an ATX heading before HTML code",
   'An unmatched ` tick.\n# Heading\nUse `npm test`.',
   'An unmatched ` tick.\nHeading\nUse npm test.',
   '<p>An unmatched ` tick.</p>\n<h1>Heading</h1>\n<p>Use <code class="notranslate">npm test</code>.</p>');
+eq("unmatched single tick does not hide a later complete double-tick span",
+  'Before ` unmatched then ``<code>x</code>`` after',
+  'Before ` unmatched then ``<code>x</code>`` after',
+  'Before ` unmatched then <code>x</code> after',
+  '<p>Before ` unmatched then <code>&lt;code&gt;x&lt;/code&gt;</code> after</p>');
 eq("only the first escaped tick in a delimiter run is literal",
   'Use \\``<b>literal</b>` after',
   'Use \\``<b>literal</b>` after',
@@ -250,6 +273,11 @@ eq("authored code decodes GitHub's named HTML5 entities",
   '`© — … é ™   \t 🚀`',
   '© — … é ™   \t 🚀',
   '<p><code class="notranslate">© — … é ™   \t 🚀</code></p>');
+eq("GitHub keeps semicolonless entities literal in raw code",
+  '<code class="x">&copy &#169</code>',
+  '`&copy &#169`',
+  '&copy &#169',
+  '<p><code class="notranslate">&amp;copy &amp;#169</code></p>');
 eq("unknown named entities do not resolve through object prototypes",
   '<code class="x">&constructor; &toString;</code>',
   '`&constructor; &toString;`',
@@ -285,6 +313,8 @@ eq("authored code matches GitHub replacement for invalid numeric references",
   '`x � � � � � y`',
   'x � � � � � y',
   '<p><code class="notranslate">x � � � � � y</code></p>');
+eq("a replacement character alone in authored code is not discarded",
+  '<code class="x">&#128;</code>', '`�`', '�', '<p><code>�</code></p>');
 eq("nested Markdown code keeps its literal HTML spelling",
   '<code class="x">foo `<em>bar</em>`</code>',
   '`foo <em>bar</em>`',

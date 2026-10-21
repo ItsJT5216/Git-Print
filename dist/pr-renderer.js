@@ -1132,7 +1132,8 @@ function replaceRawCodeElements(source, markdownCodeSpans, replace) {
             continue;
         }
         const tag = source.slice(start, token.next);
-        if (/^<\/code\s*>$/i.test(tag)) {
+        if (/^<\/code\s*>$/i.test(tag) &&
+            !insideMarkdownCodeSpan(markdownCodeSpans, start)) {
             if (open) {
                 pieces.push(source.slice(copied, open.start), replace(source.slice(open.start, token.next), source.slice(open.contentStart, start), open.start));
                 copied = token.next;
@@ -1601,7 +1602,8 @@ function findMarkdownCodeSpans(source) {
     const spans = [];
     const htmlBlocks = findHtmlBlockRanges(source);
     let htmlBlockIndex = 0;
-    let active = null;
+    const active = new Map();
+    let activeQuoteDepth = null;
     let fence = null;
     let lineStart = 0;
     while (lineStart <= source.length) {
@@ -1614,6 +1616,8 @@ function findMarkdownCodeSpans(source) {
             htmlBlockIndex++;
         }
         if (htmlBlockIndex < htmlBlocks.length && htmlBlocks[htmlBlockIndex].start <= lineStart) {
+            active.clear();
+            activeQuoteDepth = null;
             lineStart = htmlBlocks[htmlBlockIndex].end;
             if (lineStart >= source.length)
                 break;
@@ -1635,21 +1639,23 @@ function findMarkdownCodeSpans(source) {
                 break;
             continue;
         }
-        if (active) {
+        if (active.size > 0) {
             if (!line.trim()) {
-                active = null;
+                active.clear();
+                activeQuoteDepth = null;
             }
             else {
-                const content = quote.depth >= active.quoteDepth ? quote.text : line;
-                if (quote.depth > active.quoteDepth ||
-                    (quote.depth >= active.quoteDepth && !quote.text.trim()) ||
+                const content = quote.depth >= (activeQuoteDepth ?? 0) ? quote.text : line;
+                if (quote.depth > (activeQuoteDepth ?? 0) ||
+                    (quote.depth >= (activeQuoteDepth ?? 0) && !quote.text.trim()) ||
                     GFM_BLOCK_INTERRUPT.test(content)) {
-                    active = null;
+                    active.clear();
+                    activeQuoteDepth = null;
                 }
             }
         }
         const fenceStart = quote.text.match(/^ {0,3}(`{3,}|~{3,})/);
-        if (!active && fenceStart) {
+        if (active.size === 0 && fenceStart) {
             fence = {
                 marker: fenceStart[1][0],
                 width: fenceStart[1].length,
@@ -1669,25 +1675,38 @@ function findMarkdownCodeSpans(source) {
             while (source[i] === "`")
                 i++;
             const runEnd = i;
-            if (!active) {
-                let slashes = 0;
-                for (let j = runStart - 1; j >= lineStart && source[j] === "\\"; j--)
-                    slashes++;
-                const opener = runStart + (slashes % 2 ? 1 : 0);
-                const width = runEnd - opener;
-                if (width > 0)
-                    active = { start: opener, width, quoteDepth: quote.depth };
+            let slashes = 0;
+            for (let j = runStart - 1; j >= lineStart && source[j] === "\\"; j--)
+                slashes++;
+            const opener = runStart + (slashes % 2 ? 1 : 0);
+            const width = runEnd - opener;
+            if (width === 0)
+                continue;
+            const matchingOpener = active.get(width);
+            if (matchingOpener) {
+                spans.push({ start: matchingOpener.start, end: runEnd });
+                active.delete(width);
+                if (active.size === 0)
+                    activeQuoteDepth = null;
             }
-            else if (runEnd - runStart === active.width) {
-                spans.push({ start: active.start, end: runEnd });
-                active = null;
+            else {
+                if (activeQuoteDepth === null)
+                    activeQuoteDepth = quote.depth;
+                active.set(width, { start: opener });
             }
         }
         lineStart = lineEnd + 1;
         if (lineEnd === source.length)
             break;
     }
-    return spans;
+    spans.sort((a, b) => a.start - b.start || a.end - b.end);
+    const nonOverlapping = [];
+    for (const span of spans) {
+        if (nonOverlapping.length > 0 && span.start < nonOverlapping[nonOverlapping.length - 1].end)
+            continue;
+        nonOverlapping.push(span);
+    }
+    return nonOverlapping;
 }
 function insideMarkdownCodeSpan(spans, position) {
     let lo = 0;
@@ -2082,7 +2101,8 @@ function processDetailsBlocks(s, findingHeader) {
             const whole = match[0];
             const summaryHtml = match[1] || "";
             const content = match[2] || "";
-            const plain = stripRenderedHtmlTags(summaryHtml)
+            const summaryText = replaceHtmlTagTokens(summaryHtml, (tag) => /^<br\b/i.test(tag) ? " " : tag);
+            const plain = stripRenderedHtmlTags(summaryText)
                 .replace(/\\\./g, ".")
                 .replace(/\s+/g, " ")
                 .trim();
@@ -2295,7 +2315,94 @@ function numberAnnotatedDiffFences(s, ctx, anchor) {
  *  (`[^1]: …`) excluded.
  *  Prose that merely looks reference-like (`[ERROR]: timeout`) does NOT match
  *  because `timeout` is not URL-shaped. */
-const LINK_DEF_LINE = /^[ \t]*\[(?!\^)([^\]]+)\]:[ \t]*(?:<[^>\n]*>|[a-z][a-z0-9+.-]*:\/\/\S+|(?:mailto|tel):\S+|[./#]\S*)[ \t]*(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\))?[ \t]*$/gim;
+/** Parse one URL-shaped reference definition without a backtracking regex. */
+function parseLinkDefinitionLine(line) {
+    let i = 0;
+    while (line[i] === " " || line[i] === "\t")
+        i++;
+    if (line[i] !== "[")
+        return null;
+    const labelStart = ++i;
+    if (line[i] === "^")
+        return null;
+    const labelEnd = line.indexOf("]", i);
+    if (labelEnd < 0 || labelEnd === labelStart || line.slice(labelEnd, labelEnd + 2) !== "]:")
+        return null;
+    const label = line.slice(labelStart, labelEnd);
+    i = labelEnd + 2;
+    while (line[i] === " " || line[i] === "\t")
+        i++;
+    if (line[i] === "<") {
+        const close = line.indexOf(">", i + 1);
+        if (close < 0)
+            return null;
+        i = close + 1;
+    }
+    else {
+        const targetStart = i;
+        while (i < line.length && line[i] !== " " && line[i] !== "\t")
+            i++;
+        if (i === targetStart)
+            return null;
+        const target = line.slice(targetStart, i);
+        const lower = target.toLowerCase();
+        const schemeEnd = target.indexOf("://");
+        const isScheme = schemeEnd > 0 && schemeEnd + 3 < target.length &&
+            /^[a-z][a-z0-9+.-]*$/i.test(target.slice(0, schemeEnd));
+        const isMailOrTel = (lower.startsWith("mailto:") && target.length > 7) ||
+            (lower.startsWith("tel:") && target.length > 4);
+        const isRelative = /^[./#]/.test(target);
+        if (!isScheme && !isMailOrTel && !isRelative)
+            return null;
+    }
+    while (line[i] === " " || line[i] === "\t")
+        i++;
+    if (i < line.length) {
+        const quote = line[i];
+        if (quote === "\"" || quote === "'") {
+            const close = line.indexOf(quote, i + 1);
+            if (close < 0)
+                return null;
+            i = close + 1;
+        }
+        else if (quote === "(") {
+            const close = line.indexOf(")", i + 1);
+            if (close < 0)
+                return null;
+            i = close + 1;
+        }
+        else
+            return null;
+        while (line[i] === " " || line[i] === "\t")
+            i++;
+    }
+    return i === line.length ? label : null;
+}
+function forEachLinkDefinition(text, visit) {
+    for (let start = 0; start < text.length;) {
+        const newline = text.indexOf("\n", start);
+        const end = newline < 0 ? text.length : newline;
+        const label = parseLinkDefinitionLine(text.slice(start, end));
+        if (label !== null)
+            visit(label);
+        start = newline < 0 ? text.length : newline + 1;
+    }
+}
+function stripLinkDefinitionLines(text) {
+    const pieces = [];
+    let copied = 0;
+    for (let start = 0; start < text.length;) {
+        const newline = text.indexOf("\n", start);
+        const lineEnd = newline < 0 ? text.length : newline;
+        if (parseLinkDefinitionLine(text.slice(start, lineEnd)) !== null) {
+            pieces.push(text.slice(copied, start));
+            copied = newline < 0 ? text.length : newline + 1;
+        }
+        start = newline < 0 ? text.length : newline + 1;
+    }
+    pieces.push(text.slice(copied));
+    return pieces.join("");
+}
 /**
  * Markdown link/image debris removal — the web→markdown translation artifacts
  * that carry no PR meaning. Fence and inline-code contents are protected
@@ -2321,13 +2428,18 @@ const LINK_DEF_LINE = /^[ \t]*\[(?!\^)([^\]]+)\]:[ \t]*(?:<[^>\n]*>|[a-z][a-z0-9
  *   - Bracket pairs without a matching definition (`arr[1][2]`, `[ERROR]: x`)
  *     — GitHub shows them literally, so we keep them literally.
  */
-function stripInlineLinkTargets(source) {
-    const nextClosingBracket = new Int32Array(source.length);
-    let nextBracket = -1;
-    for (let i = source.length - 1; i >= 0; i--) {
-        if (source[i] === "]")
-            nextBracket = i;
-        nextClosingBracket[i] = nextBracket;
+function stripInlineLinkTargets(source, depth = 0) {
+    if (depth >= 64)
+        return source;
+    const matchingBracket = new Int32Array(source.length);
+    matchingBracket.fill(-1);
+    const openBrackets = [];
+    for (let i = 0; i < source.length; i++) {
+        if (source[i] === "[")
+            openBrackets.push(i);
+        else if (source[i] === "]" && openBrackets.length > 0) {
+            matchingBracket[openBrackets.pop()] = i;
+        }
     }
     const matchingParen = new Int32Array(source.length);
     matchingParen.fill(-1);
@@ -2343,12 +2455,13 @@ function stripInlineLinkTargets(source) {
     let copied = 0;
     for (let i = 0; i < source.length;) {
         const image = source[i] === "!" && source[i + 1] === "[";
-        if (source[i] !== "[" && !image) {
+        const bracketStart = i + (image ? 1 : 0);
+        if (source[bracketStart] !== "[") {
             i++;
             continue;
         }
-        const labelStart = i + (image ? 2 : 1);
-        const labelEnd = nextClosingBracket[labelStart] ?? -1;
+        const labelStart = bracketStart + 1;
+        const labelEnd = matchingBracket[bracketStart] ?? -1;
         if (labelEnd < labelStart || source[labelEnd + 1] !== "(") {
             i++;
             continue;
@@ -2358,7 +2471,7 @@ function stripInlineLinkTargets(source) {
             i++;
             continue;
         }
-        const label = source.slice(labelStart, labelEnd);
+        const label = stripInlineLinkTargets(source.slice(labelStart, labelEnd), depth + 1);
         if (image || label.trim() === "") {
             let removalStart = i;
             while (removalStart > copied && /[ \t]/.test(source[removalStart - 1]))
@@ -2382,8 +2495,7 @@ function stripLinkDebris(body, shieldUnverifiedMultilineTags = true) {
     body.split(/(```[\s\S]*?```)/g).forEach((part, i) => {
         if (i % 2 === 1)
             return; // fence — definitions inside code don't count
-        for (const m of part.matchAll(LINK_DEF_LINE))
-            defined.add(m[1].trim().toLowerCase());
+        forEachLinkDefinition(part, (label) => defined.add(label.trim().toLowerCase()));
     });
     // Pass 2 — transform prose segments.
     return transformProse(body, (seg) => {
@@ -2404,7 +2516,7 @@ function stripLinkDebris(body, shieldUnverifiedMultilineTags = true) {
             return defined.has(label) ? text : full;
         });
         // Remove the URL-shaped definition lines themselves (+ their newline).
-        s = s.replace(new RegExp(LINK_DEF_LINE.source + "\\n?", "gim"), "");
+        s = stripLinkDefinitionLines(s);
         return s;
     }, shieldUnverifiedMultilineTags);
 }
@@ -2445,16 +2557,21 @@ export function cleanCommentBody(raw, findingHeader, renderedText, renderedHtml)
                     return part;
                 const markdownCodeSpans = findMarkdownCodeSpans(part);
                 return replaceRawCodeElements(part, markdownCodeSpans, (match, inner) => {
-                    const text = rawCodeElementText(inner).trim();
-                    if (!text)
+                    const visible = rawCodeElementText(inner);
+                    if (!visible.trim())
                         return "";
+                    const leadingLength = visible.length - visible.trimStart().length;
+                    const trailingLength = visible.length - visible.trimEnd().length;
+                    const leading = visible.slice(0, leadingLength);
+                    const trailing = visible.slice(visible.length - trailingLength);
+                    const text = visible.slice(leadingLength, visible.length - trailingLength);
                     if (text.includes("\n")) {
                         const html = "<code>" + text.split("\n").map(escapeCodeHtmlText).join("<br>") + "</code>";
                         const token = multilineCodeNonce + ":html:" + multilineCodeHtml.length + ":";
                         multilineCodeHtml.push(html);
-                        return token;
+                        return leading + token + trailing;
                     }
-                    return asMarkdownCodeSpan(text);
+                    return leading + asMarkdownCodeSpan(text) + trailing;
                 });
             }).join("");
         }
@@ -2625,7 +2742,9 @@ export function cleanCommentBody(raw, findingHeader, renderedText, renderedHtml)
     }
     // If nothing but punctuation / rules / emoji remains, treat as empty so the
     // card is skipped rather than printed as a stray "---" or lone symbol.
-    if (!/[\p{L}\p{N}]/u.test(s))
+    const hasCodeContent = findMarkdownCodeSpans(s).some((span) => span.end > span.start) ||
+        findFencedCodeRanges(s).some((range) => s.slice(range.start, range.end).split("\n").slice(1, -1).some((line) => line.trim()));
+    if (!/[\p{L}\p{N}]/u.test(s) && !hasCodeContent)
         return "";
     for (let i = 0; i < multilineCodeHtml.length; i++) {
         s = s.split(multilineCodeNonce + ":html:" + i + ":").join(multilineCodeHtml[i]);
