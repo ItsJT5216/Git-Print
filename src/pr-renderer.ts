@@ -2328,11 +2328,59 @@ function rawCodeElementText(source: string): string {
   return visible;
 }
 
-/** Make a Markdown code span whose delimiter cannot collide with its text. */
-function asMarkdownCodeSpan(text: string): string {
-  let longest = 0;
-  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
-  const delimiter = "`".repeat(longest + 1);
+function inlineCodeDelimiterContext(source: string, start: number, end: number): string {
+  const lineStarts = [0];
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] === "\n") lineStarts.push(i + 1);
+  }
+  const lineIndexAt = (position: number): number => {
+    let lo = 0, hi = lineStarts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (lineStarts[mid] <= position) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.max(0, lo - 1);
+  };
+
+  const previousParagraphBreak = source.lastIndexOf("\n\n", Math.max(0, start - 1));
+  let paragraphStart = previousParagraphBreak < 0 ? 0 : previousParagraphBreak + 2;
+  let line = lineIndexAt(paragraphStart);
+  const startLine = lineIndexAt(start);
+  for (; line < startLine; line++) {
+    const lineStart = lineStarts[line];
+    const lineEnd = source.indexOf("\n", lineStart);
+    const text = source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd);
+    if (GFM_BLOCK_INTERRUPT.test(text)) {
+      paragraphStart = lineEnd < 0 ? source.length : lineEnd + 1;
+    }
+  }
+
+  let paragraphEnd = source.indexOf("\n\n", end);
+  if (paragraphEnd < 0) paragraphEnd = source.length;
+  line = lineIndexAt(end);
+  while (line + 1 < lineStarts.length && lineStarts[line + 1] < paragraphEnd) {
+    const lineStart = lineStarts[line + 1];
+    const lineEnd = source.indexOf("\n", lineStart);
+    const text = source.slice(lineStart, lineEnd < 0 ? source.length : lineEnd);
+    if (GFM_BLOCK_INTERRUPT.test(text)) {
+      paragraphEnd = lineStart;
+      break;
+    }
+    line++;
+  }
+  return source.slice(paragraphStart, start) + source.slice(end, paragraphEnd);
+}
+
+/** Choose a code-span delimiter absent from both its text and paragraph. */
+function asMarkdownCodeSpan(text: string, surrounding = ""): string {
+  const usedWidths = new Set<number>();
+  for (const source of [text, surrounding]) {
+    for (const match of source.matchAll(/`+/g)) usedWidths.add(match[0].length);
+  }
+  let width = 1;
+  while (usedWidths.has(width)) width++;
+  const delimiter = "`".repeat(width);
   const pad = text.startsWith("`") || text.endsWith("`") || text.startsWith(" ") || text.endsWith(" ");
   return `${delimiter}${pad ? " " : ""}${text}${pad ? " " : ""}${delimiter}`;
 }
@@ -3077,7 +3125,7 @@ export function cleanCommentBody(
       input = mapOutsideFencedCodeBlocks(value, (part) => {
         const markdownCodeSpans = findMarkdownCodeSpans(part);
         return replaceRawCodeElements(part, markdownCodeSpans,
-          (_match, inner) => {
+          (_match, inner, start) => {
             const visible = rawCodeElementText(inner);
             if (!visible.trim()) return visible;
             const leadingLength = visible.length - visible.trimStart().length;
@@ -3091,7 +3139,8 @@ export function cleanCommentBody(
               multilineCodeHtml.push(html);
               return leading + token + trailing;
             }
-            return leading + asMarkdownCodeSpan(text) + trailing;
+            const context = inlineCodeDelimiterContext(part, start, start + _match.length);
+            return leading + asMarkdownCodeSpan(text, context) + trailing;
           });
       });
     } else {

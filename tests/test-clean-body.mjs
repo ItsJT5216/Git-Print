@@ -372,7 +372,7 @@ eq("a replacement character alone in authored code is not discarded",
   '<code class="x">&#128;</code>', '`�`', '�', '<p><code>�</code></p>');
 eq("an unmatched backtick does not hide GitHub-rendered raw code",
   'Before \u0060 unmatched <code>foo</code>',
-  'Before \u0060 unmatched \u0060foo\u0060',
+  'Before \u0060 unmatched \u0060\u0060foo\u0060\u0060',
   undefined,
   '<p>Before \u0060 unmatched <code class="notranslate">foo</code></p>');
 eq("nested Markdown code keeps its literal HTML spelling",
