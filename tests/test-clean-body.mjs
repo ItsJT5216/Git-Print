@@ -233,6 +233,15 @@ eq("whitespace-only raw code preserves the separator between prose",
 eq("quoted greater-than signs do not leak code-tag attributes",
   '<code title="a > b">hello</code>', '`hello`', 'hello',
   '<p><code title="a &gt; b">hello</code></p>');
+eq("quoted greater-than signs do not leak emphasis attributes",
+  '<strong title="a > b">hello</strong>', '**hello**', 'hello',
+  '<p><strong title="a &gt; b">hello</strong></p>');
+eq("quoted greater-than signs do not leak heading attributes",
+  '<h3 title="a > b">Summary</h3>Body', '**Summary**\nBody', 'Summary Body',
+  '<h3 title="a &gt; b">Summary</h3><p>Body</p>');
+eq("quoted greater-than signs do not leak list-item attributes",
+  '<ul><li title="a > b">one</li></ul>', '- one', 'one',
+  '<ul><li title="a &gt; b">one</li></ul>');
 eq("quoted greater-than signs inside nested code markup are stripped whole",
   '<code>foo <span title="a > b">bar</span></code>', '`foo bar`', 'foo bar',
   '<p><code>foo <span title="a &gt; b">bar</span></code></p>');

@@ -1240,7 +1240,7 @@ function transformProse(
       if (shieldUnverifiedMultilineTags) {
         tokenized = shieldMultilineCodeTags(tokenized, nonce, spans);
       }
-      let out = transform(tokenized);
+      let out = transform(escapeQuotedTagGreaterThan(tokenized));
       // Restore outer tokens first because their content may contain inner tokens.
       for (let j = spans.length - 1; j >= 0; j--) {
         out = out.split(`${nonce}:${j}:`).join(spans[j]);
@@ -1362,6 +1362,23 @@ function findHtmlTagToken(
     return null;
   }
   return scanHtmlTagEnd(source, name);
+}
+
+function escapeQuotedTagGreaterThan(source: string): string {
+  return replaceHtmlTagTokens(source, (tag) => {
+    let quote = "";
+    let escaped = "";
+    for (const char of tag) {
+      if (quote && char === ">") escaped += "&gt;";
+      else escaped += char;
+      if (quote) {
+        if (char === quote) quote = "";
+      } else if (char === "\"" || char === "'") {
+        quote = char;
+      }
+    }
+    return escaped;
+  });
 }
 
 function replaceRawCodeElements(
