@@ -20,7 +20,7 @@
  */
 
 import { renderPR } from "../dist/pr-renderer.js";
-import { readFile, unlink } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -190,6 +190,14 @@ const data = {
       created_at: "2026-06-07T10:02:00Z",
       author_association: "NONE",
     },
+    {
+      id: 203,
+      body: '<center>\n<img src="https://img.shields.io/badge/x.svg">\n</center>',
+      body_text: "",
+      user: { login: "badge-bot", type: "Bot" },
+      created_at: "2026-06-07T10:03:00Z",
+      author_association: "NONE",
+    },
   ],
   resolvedThreadMap: null,
   unifiedChecks: [
@@ -206,7 +214,8 @@ const data = {
 
 // ─── Run renderer ─────────────────────────────────────────────────────────────
 
-const outPath = join(tmpdir(), `pr20-fixture-${Date.now()}.md`);
+const tempDir = await mkdtemp(join(tmpdir(), "git-print-render-fixture-"));
+const outPath = join(tempDir, "review.md");
 await renderPR(data, {
   owner: "itstanner5216",
   repo: "zenith",
@@ -215,7 +224,27 @@ await renderPR(data, {
   outputPath: outPath,
 });
 const out = await readFile(outPath, "utf-8");
-await unlink(outPath).catch(() => {});
+
+// GitHub renders this whole multiline span as code. A metadata-looking line
+// inside it must remain in both a thread root and a reply, not migrate to a
+// severity label or disappear before cleanCommentBody can protect it.
+const codeBody = 'Code: `start\r\nSeverity: High\r\nend`';
+const normalizedCodeBody = 'Code: `start\nSeverity: High\nend`';
+const codeHtml = '<p>Code: <code class="notranslate">start Severity: High end</code></p>';
+const codeRoot = {
+  ...data.reviewComments[0], id: 301, in_reply_to_id: null,
+  body: codeBody, body_text: 'Code: start Severity: High end', body_html: codeHtml,
+};
+const codeReply = {
+  ...codeRoot, id: 302, in_reply_to_id: 301,
+  created_at: "2026-06-07T10:00:01Z",
+};
+const codeOutPath = join(tempDir, "code-review.md");
+await renderPR({ ...data, reviews: [], issueComments: [], reviewComments: [codeRoot, codeReply] }, {
+  owner: "itstanner5216", repo: "zenith", pullNumber: 20,
+  token: "dummy", outputPath: codeOutPath,
+});
+const codeOut = await readFile(codeOutPath, "utf-8");
 
 // ─── Assertions ───────────────────────────────────────────────────────────────
 
@@ -228,9 +257,9 @@ const has = (s) => out.includes(s);
 check("h1 title", has("# PR #20 — feat(tree-sitter): export DEF_TYPES + regression test for definition node coverage"));
 check("status line", has("**Open** · itstanner5216 wants to merge 4 commits into `main` from `feat/def-types-coverage`"));
 // Conversation count mirrors the GitHub page number — the promo-only comment
-// exists on the page (we just don't print it), so it counts: 2 issue comments
-// + 2 review comments + 1 review with body = 5.
-check("counters line", has("Conversation 5 · Commits 4 · Checks 7 · Files changed 3 · `+73` `−0`"));
+// exists on the page (we just don't print it), so it counts: 3 issue comments
+// + 2 review comments + 1 review with body = 6.
+check("counters line", has("Conversation 6 · Commits 4 · Checks 7 · Files changed 3 · `+73` `−0`"));
 
 // ── PR description as post body (directly under title, unlabeled) ──
 check("description present", has("Exports the DEF_TYPES constant from the tree-sitter symbols module"));
@@ -243,13 +272,14 @@ check("labels", has("- **Labels:** None"));
 check("milestone", has("- **Milestone:** None"));
 
 // ── One flat Comments flow, numbered in scroll order ──
-check("comments heading", has("## Comments"));
+check("no redundant comments heading", !has("## Comments"));
 check("comment 1", has("### Comment #1"));
 check("comment 2", has("### Comment #2"));
 check("comment 3", has("### Comment #3"));
 check("comment 4", has("### Comment #4"));
 const commentHeaders = (out.match(/^### Comment #\d+$/gm) || []).length;
 check("exactly 4 numbered comments (promo-only comment skipped)", commentHeaders === 4);
+check("invisible tag-only comment skipped", !has("badge-bot") && !has("### Comment #5"));
 check("ordering c1<c2<c3<c4",
   idx("### Comment #1") < idx("### Comment #2") &&
   idx("### Comment #2") < idx("### Comment #3") &&
@@ -278,9 +308,9 @@ check("t1 numbered context 158", has("158 + // include trailing quantifier + cap
 check("t1 prose byte-faithful", has("extractDefinitionNodeTypes() currently breaks on an unmatched delimiter because findMatchingClose() returns -1."));
 check("t1 severity line not duplicated in body", !/^Severity: Medium$/m.test(out));
 check("t1 changeset header with path", has("**Suggested changeset 1:** `packages/zenith-mcp/tests/def-types-coverage.test.js`"));
-check("t1 @@ header with heading", /@@ -\d+,\d+ \+\d+,\d+ @@ function extractDefinitionNodeTypes\(scmText\) \{/.test(out));
-check("t1 removed line", has("-if (end === -1) break;"));
-check("t1 added throw", has("+  throw new Error(`Malformed tree-sitter query: unmatched ${c} at offset ${i}`);"));
+check("t1 numbered suggested context", has("152   const text = scmText;"));
+check("t1 removed line", has("157 - if (end === -1) break;"));
+check("t1 added throw", has("158 +   throw new Error(`Malformed tree-sitter query: unmatched ${c} at offset ${i}`);"));
 check("t1 unchanged line is context not removal", !has("-if (c !== '(' && c !== '[')"));
 check("t1 Copilot footer dropped", !has("Copilot uses AI"));
 
@@ -289,8 +319,8 @@ check("t2 header has severity low", has("**Copilot [AI]** reviewed · 2026-06-07
 check("t2 file+anchor", has("`packages/zenith-mcp/src/core/tree-sitter/symbols.ts` — line +68"));
 check("t2 numbered context 65", has("65 + // ----------------------------------------------------------"));
 check("t2 numbered context 68", has("68 +   // XML/HTML element-shape patterns (camelCase upstream node names)"));
-check("t2 removed camelCase", has("-  // XML/HTML element-shape patterns (camelCase upstream node names)"));
-check("t2 added PascalCase", has("+  // XML/HTML element-shape patterns (PascalCase upstream node names)"));
+check("t2 removed camelCase", has("68 -   // XML/HTML element-shape patterns (camelCase upstream node names)"));
+check("t2 added PascalCase", has("68 +   // XML/HTML element-shape patterns (PascalCase upstream node names)"));
 
 // ── Comment 4 (noisy issue comment): debris policy in the render path ──
 check("c4 link text kept", has("Check the migration guide before merging"));
@@ -317,10 +347,15 @@ check("merge blocked with reasons", has("**Merging is blocked** — 1 change req
 check("no triple newlines outside fences",
   out.split(/```[\s\S]*?```/g).every((seg) => !seg.includes("\n\n\n")));
 check("single H1", (out.match(/^# /gm) || []).length === 1);
+check("severity-looking code survives in root and reply",
+  codeOut.split(normalizedCodeBody).length - 1 === 2);
+check("severity-looking code is not promoted to thread metadata",
+  !codeOut.includes("· Severity: High"));
 
 // ─── Report ───────────────────────────────────────────────────────────────────
 
 const total = failures.length;
+await rm(tempDir, { recursive: true, force: true });
 if (total === 0) {
   console.log(`PASS — all assertions passed (${out.length} bytes rendered).`);
   process.exit(0);
