@@ -71,6 +71,14 @@ eq("nested links preserve the visible outer syntax",
   '\\[inner\\](https://o)',
   '[inner](https://o)',
   '<p>[<a href="https://i" rel="nofollow">inner</a>](<a href="https://o" rel="nofollow">https://o</a>)</p>');
+eq("escaped brackets stay literal inside link labels",
+  'See [read \\[draft](https://example.com)',
+  'See read \\[draft',
+  'See read [draft',
+  '<p>See <a href="https://example.com" rel="nofollow">read [draft</a></p>');
+eq("escaped parentheses do not break link-target matching",
+  '[guide](https://example.com/a\\(b\\))', 'guide', 'guide',
+  '<p><a href="https://example.com/a(b)" rel="nofollow">guide</a></p>');
 
 eq("reference link unwraps when defined",
   "See [docs][1] and [api][2] here\n\n[1]: https://docs.example.com\n[2]: https://api.example.com",
@@ -285,6 +293,11 @@ eq("backslash-escaped raw tags remain visible text",
   'Use \\<center>literal',
   'Use <center>literal',
   '<p>Use &lt;center&gt;literal</p>');
+eq("escaped raw code openers are not converted into Markdown delimiters",
+  'Use \\<code>x</code>',
+  'Use \\<code>x',
+  'Use <code>x',
+  '<p>Use &lt;code&gt;x</p>');
 eq("quoted greater-than signs do not end an HTML tag early",
   '<x-wrap title="a > b">Hello</x-wrap>',
   'Hello',
@@ -499,6 +512,11 @@ eq("raw HTML block text cannot consume a later rendered code match",
   '<div>Fake: `start\n[x](url)\nend`</div>\n\nReal: `start\n[x](url)\nend`',
   'Fake: `start\n[x](url)\nend` Real: start [x](url) end',
   '<div>Fake: `start\n[x](url)\nend`</div>\n<p>Real: <code class="notranslate">start [x](url) end</code></p>');
+eq("adjacent comments do not hide following HTML blocks",
+  '<!-- metadata -->\n<div>Visible [x](url)</div>',
+  '<div>Visible [x](url)</div>',
+  'Visible [x](url)',
+  '<div>Visible [x](url)</div>');
 eq("standalone inline HTML does not interrupt a paragraph code span",
   'Use `a [x](url)\n<span>\nb`',
   'Use `a [x](url)\n<span>\nb`',

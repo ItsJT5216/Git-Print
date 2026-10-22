@@ -1152,7 +1152,7 @@ function replaceRawCodeElements(source, markdownCodeSpans, replace) {
             continue;
         }
         const tag = source.slice(start, token.next);
-        if (/^<\/code\s*>$/i.test(tag) &&
+        if (/^<\/code\s*>$/i.test(tag) && !isEscapedByBackslash(source, start) &&
             !insideMarkdownCodeSpan(markdownCodeSpans, start)) {
             if (open) {
                 pieces.push(source.slice(copied, open.start), replace(source.slice(open.start, token.next), source.slice(open.contentStart, start), open.start));
@@ -1161,6 +1161,7 @@ function replaceRawCodeElements(source, markdownCodeSpans, replace) {
             }
         }
         else if (/^<code(?=[\s/>])/i.test(tag) && !/\/\s*>$/.test(tag) &&
+            !isEscapedByBackslash(source, start) &&
             !open && !insideMarkdownCodeSpan(markdownCodeSpans, start)) {
             open = { start, contentStart: token.next };
         }
@@ -1307,13 +1308,16 @@ function replaceHtmlTagTokens(source, replace) {
     pieces.push(source.slice(copied));
     return pieces.join("");
 }
+function isEscapedByBackslash(source, start) {
+    let slashes = 0;
+    for (let i = start - 1; i >= 0 && source[i] === "\\"; i--)
+        slashes++;
+    return slashes % 2 === 1;
+}
 /** Protect backslash-escaped HTML tags that GitHub renders as literal text. */
 function shieldEscapedHtmlTags(source, nonce, spans) {
     return replaceHtmlTagTokens(source, (tag, start) => {
-        let slashes = 0;
-        for (let i = start - 1; i >= 0 && source[i] === "\\"; i--)
-            slashes++;
-        if (slashes % 2 === 0)
+        if (!isEscapedByBackslash(source, start))
             return tag;
         const token = nonce + ":" + spans.length + ":";
         spans.push(tag);
@@ -1382,7 +1386,7 @@ function mergeSourceRanges(ranges) {
     const merged = [];
     for (const range of sorted) {
         const previous = merged[merged.length - 1];
-        if (previous && range.start <= previous.end) {
+        if (previous && range.start < previous.end) {
             previous.end = Math.max(previous.end, range.end);
         }
         else {
@@ -2452,13 +2456,25 @@ function stripLinkDefinitionLines(text) {
 function stripInlineLinkTargets(source, depth = 0) {
     if (depth >= 64)
         return source;
+    const escaped = new Uint8Array(source.length);
+    for (let i = 0; i < source.length;) {
+        if (source[i] !== "\\") {
+            i++;
+            continue;
+        }
+        const start = i;
+        while (source[i] === "\\")
+            i++;
+        if ((i - start) % 2 === 1 && i < source.length)
+            escaped[i] = 1;
+    }
     const matchingBracket = new Int32Array(source.length);
     matchingBracket.fill(-1);
     const openBrackets = [];
     for (let i = 0; i < source.length; i++) {
-        if (source[i] === "[")
+        if (source[i] === "[" && !escaped[i])
             openBrackets.push(i);
-        else if (source[i] === "]" && openBrackets.length > 0) {
+        else if (source[i] === "]" && !escaped[i] && openBrackets.length > 0) {
             matchingBracket[openBrackets.pop()] = i;
         }
     }
@@ -2466,24 +2482,25 @@ function stripInlineLinkTargets(source, depth = 0) {
     matchingParen.fill(-1);
     const openParens = [];
     for (let i = 0; i < source.length; i++) {
-        if (source[i] === "(")
+        if (source[i] === "(" && !escaped[i])
             openParens.push(i);
-        else if (source[i] === ")" && openParens.length > 0) {
+        else if (source[i] === ")" && !escaped[i] && openParens.length > 0) {
             matchingParen[openParens.pop()] = i;
         }
     }
     const pieces = [];
     let copied = 0;
     for (let i = 0; i < source.length;) {
-        const image = source[i] === "!" && source[i + 1] === "[";
+        const image = source[i] === "!" && !escaped[i] &&
+            source[i + 1] === "[" && !escaped[i + 1];
         const bracketStart = i + (image ? 1 : 0);
-        if (source[bracketStart] !== "[") {
+        if (source[bracketStart] !== "[" || escaped[bracketStart]) {
             i++;
             continue;
         }
         const labelStart = bracketStart + 1;
         const labelEnd = matchingBracket[bracketStart] ?? -1;
-        if (labelEnd < labelStart || source[labelEnd + 1] !== "(") {
+        if (labelEnd < labelStart || source[labelEnd + 1] !== "(" || escaped[labelEnd + 1]) {
             i++;
             continue;
         }
@@ -2496,7 +2513,7 @@ function stripInlineLinkTargets(source, depth = 0) {
         let containsNestedLink = false;
         if (!image) {
             for (let nested = labelStart; nested < labelEnd; nested++) {
-                if (source[nested] !== "[" || source[nested - 1] === "!")
+                if (source[nested] !== "[" || escaped[nested] || source[nested - 1] === "!")
                     continue;
                 const nestedLabelEnd = matchingBracket[nested] ?? -1;
                 if (nestedLabelEnd <= nested || nestedLabelEnd >= labelEnd ||

@@ -1395,7 +1395,7 @@ function replaceRawCodeElements(
     const token = findHtmlTagToken(source, start);
     if (!token || token.end < 0) { i = start + 1; continue; }
     const tag = source.slice(start, token.next);
-    if (/^<\/code\s*>$/i.test(tag) &&
+    if (/^<\/code\s*>$/i.test(tag) && !isEscapedByBackslash(source, start) &&
         !insideMarkdownCodeSpan(markdownCodeSpans, start)) {
       if (open) {
         pieces.push(source.slice(copied, open.start),
@@ -1405,6 +1405,7 @@ function replaceRawCodeElements(
         open = null;
       }
     } else if (/^<code(?=[\s/>])/i.test(tag) && !/\/\s*>$/.test(tag) &&
+        !isEscapedByBackslash(source, start) &&
         !open && !insideMarkdownCodeSpan(markdownCodeSpans, start)) {
       open = { start, contentStart: token.next };
     }
@@ -1542,12 +1543,16 @@ function replaceHtmlTagTokens(
   return pieces.join("");
 }
 
+function isEscapedByBackslash(source: string, start: number): boolean {
+  let slashes = 0;
+  for (let i = start - 1; i >= 0 && source[i] === "\\"; i--) slashes++;
+  return slashes % 2 === 1;
+}
+
 /** Protect backslash-escaped HTML tags that GitHub renders as literal text. */
 function shieldEscapedHtmlTags(source: string, nonce: string, spans: string[]): string {
   return replaceHtmlTagTokens(source, (tag, start) => {
-    let slashes = 0;
-    for (let i = start - 1; i >= 0 && source[i] === "\\"; i--) slashes++;
-    if (slashes % 2 === 0) return tag;
+    if (!isEscapedByBackslash(source, start)) return tag;
     const token = nonce + ":" + spans.length + ":";
     spans.push(tag);
     return token;
@@ -1623,7 +1628,7 @@ function mergeSourceRanges(ranges: SourceRange[]): SourceRange[] {
   const merged: SourceRange[] = [];
   for (const range of sorted) {
     const previous = merged[merged.length - 1];
-    if (previous && range.start <= previous.end) {
+    if (previous && range.start < previous.end) {
       previous.end = Math.max(previous.end, range.end);
     } else {
       merged.push({ ...range });
@@ -2642,12 +2647,20 @@ function stripLinkDefinitionLines(text: string): string {
  */
 function stripInlineLinkTargets(source: string, depth = 0): string {
   if (depth >= 64) return source;
+  const escaped = new Uint8Array(source.length);
+  for (let i = 0; i < source.length;) {
+    if (source[i] !== "\\") { i++; continue; }
+    const start = i;
+    while (source[i] === "\\") i++;
+    if ((i - start) % 2 === 1 && i < source.length) escaped[i] = 1;
+  }
+
   const matchingBracket = new Int32Array(source.length);
   matchingBracket.fill(-1);
   const openBrackets: number[] = [];
   for (let i = 0; i < source.length; i++) {
-    if (source[i] === "[") openBrackets.push(i);
-    else if (source[i] === "]" && openBrackets.length > 0) {
+    if (source[i] === "[" && !escaped[i]) openBrackets.push(i);
+    else if (source[i] === "]" && !escaped[i] && openBrackets.length > 0) {
       matchingBracket[openBrackets.pop()!] = i;
     }
   }
@@ -2656,8 +2669,8 @@ function stripInlineLinkTargets(source: string, depth = 0): string {
   matchingParen.fill(-1);
   const openParens: number[] = [];
   for (let i = 0; i < source.length; i++) {
-    if (source[i] === "(") openParens.push(i);
-    else if (source[i] === ")" && openParens.length > 0) {
+    if (source[i] === "(" && !escaped[i]) openParens.push(i);
+    else if (source[i] === ")" && !escaped[i] && openParens.length > 0) {
       matchingParen[openParens.pop()!] = i;
     }
   }
@@ -2665,12 +2678,16 @@ function stripInlineLinkTargets(source: string, depth = 0): string {
   const pieces: string[] = [];
   let copied = 0;
   for (let i = 0; i < source.length;) {
-    const image = source[i] === "!" && source[i + 1] === "[";
+    const image = source[i] === "!" && !escaped[i] &&
+      source[i + 1] === "[" && !escaped[i + 1];
     const bracketStart = i + (image ? 1 : 0);
-    if (source[bracketStart] !== "[") { i++; continue; }
+    if (source[bracketStart] !== "[" || escaped[bracketStart]) { i++; continue; }
     const labelStart = bracketStart + 1;
     const labelEnd = matchingBracket[bracketStart] ?? -1;
-    if (labelEnd < labelStart || source[labelEnd + 1] !== "(") { i++; continue; }
+    if (labelEnd < labelStart || source[labelEnd + 1] !== "(" || escaped[labelEnd + 1]) {
+      i++;
+      continue;
+    }
     const targetEnd = matchingParen[labelEnd + 1] ?? -1;
     if (targetEnd < 0) { i++; continue; }
 
@@ -2678,7 +2695,7 @@ function stripInlineLinkTargets(source: string, depth = 0): string {
     let containsNestedLink = false;
     if (!image) {
       for (let nested = labelStart; nested < labelEnd; nested++) {
-        if (source[nested] !== "[" || source[nested - 1] === "!") continue;
+        if (source[nested] !== "[" || escaped[nested] || source[nested - 1] === "!") continue;
         const nestedLabelEnd = matchingBracket[nested] ?? -1;
         if (nestedLabelEnd <= nested || nestedLabelEnd >= labelEnd ||
             source[nestedLabelEnd + 1] !== "(") continue;
