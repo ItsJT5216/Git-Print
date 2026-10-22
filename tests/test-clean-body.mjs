@@ -49,6 +49,11 @@ eq("link text with code span unwraps",
 eq("angle autolink removed",
   "Translated page debris <https://whatever.side/random?link=1> here",
   "Translated page debris here");
+eq("angle autolinks are not misclassified as standalone HTML tags",
+  '<https://example.com>\n[guide](https://docs.example.com)',
+  'guide',
+  'https://example.com guide',
+  '<p><a href="https://example.com">https://example.com</a><br><a href="https://docs.example.com">guide</a></p>');
 
 eq("mailto autolink removed",
   "Contact <mailto:bot@example.com> for help",
@@ -61,6 +66,11 @@ eq("empty link removed",
 eq("linked badge images are removed through the outer link",
   "[![coverage](https://img.example/coverage.svg)](https://img.example/project)",
   "");
+eq("nested links preserve the visible outer syntax",
+  '[[inner](https://i)](https://o)',
+  '\\[inner\\](https://o)',
+  '[inner](https://o)',
+  '<p>[<a href="https://i" rel="nofollow">inner</a>](<a href="https://o" rel="nofollow">https://o</a>)</p>');
 
 eq("reference link unwraps when defined",
   "See [docs][1] and [api][2] here\n\n[1]: https://docs.example.com\n[2]: https://api.example.com",
@@ -209,9 +219,17 @@ eq("attribute-bearing heading keeps its break",
   '<h3 id="s">Summary</h3>Body text here', '**Summary**\nBody text here');
 eq("attribute-bearing code keeps code formatting",
   '<code class="language-sh">npm test</code> first', '`npm test` first');
+eq("authored code scans remaining backticks after an escaped tick",
+  "Value: <code>\\``<b>literal</b>` after</code>",
+  "Value: `` `<b>literal</b> after ``",
+  'Value: `<b>literal</b> after',
+  '<p>Value: <code>`<code>&lt;b&gt;literal&lt;/b&gt;</code> after</code></p>');
 eq("raw code preserves separating whitespace outside the generated code span",
   'a<code class="x"> b </code>c', 'a `b` c', 'a b c',
   '<p>a<code class="x"> b </code>c</p>');
+eq("whitespace-only raw code preserves the separator between prose",
+  'a<code class="x"> </code>b', 'a b', 'a b',
+  '<p>a<code class="x"> </code>b</p>');
 eq("quoted greater-than signs do not leak code-tag attributes",
   '<code title="a > b">hello</code>', '`hello`', 'hello',
   '<p><code title="a &gt; b">hello</code></p>');
@@ -223,6 +241,11 @@ eq("closing code tags inside Markdown code spans stay literal",
   '`Show </code> end`',
   'Show </code> end',
   '<p><code>Show <code>&lt;/code&gt;</code> end</code></p>');
+eq("a backslash before a closing delimiter does not hide the Markdown code span",
+  "<code>before ``</code>\\`` after</code>",
+  '`before </code>\\ after`',
+  'before </code>\\ after',
+  '<p><code>before <code>&lt;/code&gt;\\</code> after</code></p>');
 eq("prose newline cleanup leaves literal backslash-n in authored code",
   'Remove unused <code>const lineStart = s.lastIndexOf("\\n", start - 1) + 1;</code>.',
   'Remove unused `const lineStart = s.lastIndexOf("\\n", start - 1) + 1;`.',
@@ -467,11 +490,31 @@ eq("raw HTML block text cannot consume a later rendered code match",
   '<div>Fake: `start\n[x](url)\nend`</div>\n\nReal: `start\n[x](url)\nend`',
   'Fake: `start\n[x](url)\nend` Real: start [x](url) end',
   '<div>Fake: `start\n[x](url)\nend`</div>\n<p>Real: <code class="notranslate">start [x](url) end</code></p>');
+eq("standalone inline HTML does not interrupt a paragraph code span",
+  'Use `a [x](url)\n<span>\nb`',
+  'Use `a [x](url)\n<span>\nb`',
+  'Use a [x](url) <span> b',
+  '<p>Use <code>a [x](url) &lt;span&gt; b</code></p>');
+eq("four-space HTML inside a paragraph code span is not a type-seven block",
+  'Use `a [x](url)\n    <span>\nb`',
+  'Use `a [x](url)\n    <span>\nb`',
+  'Use a [x](url) <span> b',
+  '<p>Use <code>a [x](url) &lt;span&gt; b</code></p>');
 eq("images inside preserved raw HTML blocks stay omitted",
   '<div>Visible [x](url) <img src="badge.png"></div>',
   '<div>Visible [x](url) </div>',
   'Visible [x](url)',
   '<div>Visible [x](url) <img src="badge.png"></div>');
+eq("raw code elements in HTML blocks do not shield images or comments",
+  '<div>[x](url) <code>abc<img src="badge.png"><!-- hidden --></code></div>',
+  '<div>[x](url) <code>abc</code></div>',
+  '[x](url) abc',
+  '<div>[x](url) <code>abc<a href="badge.png"><img src="badge.png"></a></code></div>');
+eq("script blocks are escaped as literal text instead of restored as active HTML",
+  '<script>raw `code` [link](url)</script>',
+  '&lt;script&gt;raw &#96;code&#96; &#91;link&#93;&#40;url&#41;&lt;&#47;script&gt;',
+  'raw `code` [link](url)',
+  '&lt;script&gt;raw `code` [link](url)&lt;/script&gt;');
 eq("inline tilde runs do not exclude a confirmed multiline code span",
   'Prefix ~~~ foo `start\n[x](url)\nend` bar ~~~ suffix',
   'Prefix ~~~ foo `start\n[x](url)\nend` bar ~~~ suffix',

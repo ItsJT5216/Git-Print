@@ -1357,7 +1357,7 @@ function findHtmlTagToken(
   if (source[name] === "/") name++;
   if (!/[A-Za-z]/.test(source[name] ?? "")) return null;
   name++;
-  while (/[A-Za-z0-9:-]/.test(source[name] ?? "")) name++;
+  while (/[A-Za-z0-9-]/.test(source[name] ?? "")) name++;
   if (source[name] !== ">" && source[name] !== "/" && !/[ \t\n\f\r]/.test(source[name] ?? "")) {
     return null;
   }
@@ -1537,11 +1537,7 @@ function shieldEscapedHtmlTags(source: string, nonce: string, spans: string[]): 
   });
 }
 
-/**
- * Preserve Markdown-looking text inside raw HTML blocks. GFM does not parse
- * Markdown there, so link syntax and backticks must not enter later cleanup.
- * Images and HTML comments remain invisible and are removed before shielding.
- */
+/** Preserve raw block text whose syntax would be reinterpreted after cleanup. */
 function shieldRawHtmlBlocks(source: string):
   { masked: string; restore: (text: string) => string } {
   const nonce = randomBytes(6).toString("hex");
@@ -1549,25 +1545,27 @@ function shieldRawHtmlBlocks(source: string):
   const ranges = findHtmlBlockRanges(source).filter((range) => {
     const firstLine = source.slice(range.start, range.end).split("\n", 1)[0];
     const content = quotePrefix(firstLine).text;
-    const tagName = content.match(/^ {0,3}<([A-Za-z][A-Za-z0-9:-]*)\b/i)?.[1]?.toLowerCase();
+    const tagName = content.match(/^ {0,3}<([A-Za-z][A-Za-z0-9-]*)\b/i)?.[1]?.toLowerCase();
     return !!tagName && tagName !== "details" && tagName !== "pre";
   });
   const pieces: string[] = [];
   let copied = 0;
   for (const range of ranges) {
     let block = source.slice(range.start, range.end);
-    const codeElements: string[] = [];
-    block = replaceRawCodeElements(block, [], (code) => {
-      const token = nonce + ":code:" + codeElements.length + ":";
-      codeElements.push(code);
-      return token;
-    });
+    const firstLine = block.split("\n", 1)[0];
+    const content = quotePrefix(firstLine).text;
+    const tagName = content.match(/^ {0,3}<([A-Za-z][A-Za-z0-9-]*)\b/i)?.[1]?.toLowerCase();
+    if (tagName === "script" || tagName === "style" || tagName === "textarea") {
+      block = block.split("\n").map(escapeCodeHtmlText).join("\n");
+      pieces.push(source.slice(copied, range.start));
+      pieces.push(nonce + ":block:" + blocks.length + ":");
+      blocks.push(block);
+      copied = range.end;
+      continue;
+    }
     block = stripHtmlComments(block);
     block = block.replace(/[ \t]*<picture\b[^>]*>[\s\S]*?<\/picture\s*>/gi, "");
     block = replaceHtmlTagTokens(block, (tag) => /^<img\b/i.test(tag) ? "" : tag);
-    for (let i = 0; i < codeElements.length; i++) {
-      block = block.split(nonce + ":code:" + i + ":").join(codeElements[i]);
-    }
 
     const visibleSource = stripRenderedHtmlTags(block);
     const backtickWidths = [...visibleSource.matchAll(/`+/g)].map((match) => match[0].length);
@@ -1770,7 +1768,12 @@ function findHtmlBlockRanges(source: string): SourceRange[] {
 
     const standalone = findHtmlTagToken(source, contentStart + indent);
     if (standalone && standalone.end >= 0 &&
+        indent <= 3 &&
         !source.slice(standalone.next, lineStarts[i] + line.length).trim()) {
+      const previous = i > 0 ? quotePrefix(lines[i - 1]) : null;
+      const beginsBlock = !previous || !previous.text.trim() || previous.depth !== quote.depth ||
+        GFM_BLOCK_INTERRUPT.test(previous.text);
+      if (!beginsBlock) continue;
       let endLine = i;
       while (endLine + 1 < lines.length && quotePrefix(lines[endLine + 1]).text.trim()) endLine++;
       ranges.push({ start: lineStarts[i], end: lineEndWithNewline(endLine) });
@@ -1904,20 +1907,22 @@ function findMarkdownCodeSpans(source: string): Array<{ start: number; end: numb
       const runStart = i;
       while (source[i] === "`") i++;
       const runEnd = i;
+      const runWidth = runEnd - runStart;
+      const matchingOpener = active.get(runWidth);
+      if (matchingOpener) {
+        spans.push({ start: matchingOpener.start, end: runEnd });
+        active.delete(runWidth);
+        if (active.size === 0) activeQuoteDepth = null;
+        continue;
+      }
+
       let slashes = 0;
       for (let j = runStart - 1; j >= lineStart && source[j] === "\\"; j--) slashes++;
       const opener = runStart + (slashes % 2 ? 1 : 0);
       const width = runEnd - opener;
       if (width === 0) continue;
-      const matchingOpener = active.get(width);
-      if (matchingOpener) {
-        spans.push({ start: matchingOpener.start, end: runEnd });
-        active.delete(width);
-        if (active.size === 0) activeQuoteDepth = null;
-      } else {
-        if (activeQuoteDepth === null) activeQuoteDepth = quote.depth;
-        active.set(width, { start: opener });
-      }
+      if (activeQuoteDepth === null) activeQuoteDepth = quote.depth;
+      active.set(width, { start: opener });
     }
 
     lineStart = lineEnd + 1;
@@ -1974,14 +1979,12 @@ function rawCodeElementText(source: string): string {
       protectedSource += "\\".repeat(Math.floor(slashes / 2));
 
       if (source[i] === "`") {
-        let end = i;
-        while (source[end] === "`") end++;
-        const width = end - i;
         if (slashes % 2) {
-          protectedSource += preserve("`".repeat(width));
-          i = end;
+          protectedSource += preserve("`");
+          i++;
         }
-        // With an even run, the ticks remain Markdown delimiters.
+        // Remaining ticks, or the entire run after an even slash count, are
+        // scanned as ordinary Markdown delimiters on the next iteration.
         continue;
       }
 
@@ -2655,7 +2658,25 @@ function stripInlineLinkTargets(source: string, depth = 0): string {
     if (targetEnd < 0) { i++; continue; }
 
     const label = stripInlineLinkTargets(source.slice(labelStart, labelEnd), depth + 1);
-    if (image || label.trim() === "") {
+    let containsNestedLink = false;
+    if (!image) {
+      for (let nested = labelStart; nested < labelEnd; nested++) {
+        if (source[nested] !== "[" || source[nested - 1] === "!") continue;
+        const nestedLabelEnd = matchingBracket[nested] ?? -1;
+        if (nestedLabelEnd <= nested || nestedLabelEnd >= labelEnd ||
+            source[nestedLabelEnd + 1] !== "(") continue;
+        const nestedTargetEnd = matchingParen[nestedLabelEnd + 1] ?? -1;
+        if (nestedTargetEnd >= 0 && nestedTargetEnd < labelEnd) {
+          containsNestedLink = true;
+          break;
+        }
+      }
+    }
+
+    if (containsNestedLink) {
+      const outerTarget = source.slice(labelEnd + 2, targetEnd);
+      pieces.push(source.slice(copied, i), `\\[${label}\\](${outerTarget})`);
+    } else if (image || label.trim() === "") {
       let removalStart = i;
       while (removalStart > copied && /[ \t]/.test(source[removalStart - 1])) removalStart--;
       pieces.push(source.slice(copied, removalStart));
@@ -2753,7 +2774,7 @@ export function cleanCommentBody(
         return replaceRawCodeElements(part, markdownCodeSpans,
           (match, inner) => {
             const visible = rawCodeElementText(inner);
-            if (!visible.trim()) return "";
+            if (!visible.trim()) return visible;
             const leadingLength = visible.length - visible.trimStart().length;
             const trailingLength = visible.length - visible.trimEnd().length;
             const leading = visible.slice(0, leadingLength);
