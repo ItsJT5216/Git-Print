@@ -1314,22 +1314,85 @@ function decodeHtmlEntities(s: string): string {
 }
 
 function stripInlineMarkdownEmphasis(source: string): string {
-  let text = source;
-  const rules = [
-    /\*\*\*(\S(?:.*?\S)?)\*\*\*/g,
-    /___(\S(?:.*?\S)?)___/g,
-    /\*\*(\S(?:.*?\S)?)\*\*/g,
-    /__(\S(?:.*?\S)?)__/g,
-    /~~(\S(?:.*?\S)?)~~/g,
-    /(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)/g,
-    /(?<![\w_])_(\S(?:[^_\n]*?\S)?)_(?![\w_])/g,
-  ];
-  for (let pass = 0; pass < 4; pass++) {
-    const previous = text;
-    for (const rule of rules) text = text.replace(rule, "$1");
-    if (text === previous) break;
+  type Delimiter = { start: number; end: number; marker: string; width: number };
+  const removed = new Uint8Array(source.length);
+  const openers = new Map<string, Delimiter[]>();
+  const isWhitespace = (char: string): boolean => !!char && /\s/u.test(char);
+  const isPunctuation = (char: string): boolean => !!char && /[\p{P}\p{S}]/u.test(char);
+
+  for (let i = 0; i < source.length;) {
+    const marker = source[i];
+    if (marker !== "*" && marker !== "_" && marker !== "~") { i++; continue; }
+    const start = i;
+    while (source[i] === marker) i++;
+    const end = i;
+    const runWidth = end - start;
+    if (marker === "~" && runWidth < 2) continue;
+
+    const before = source[start - 1] ?? "";
+    const after = source[end] ?? "";
+    const beforeWhitespace = isWhitespace(before);
+    const afterWhitespace = isWhitespace(after);
+    const beforePunctuation = isPunctuation(before);
+    const afterPunctuation = isPunctuation(after);
+    const leftFlanking = !afterWhitespace &&
+      (!afterPunctuation || beforeWhitespace || beforePunctuation);
+    const rightFlanking = !beforeWhitespace &&
+      (!beforePunctuation || afterWhitespace || afterPunctuation);
+    const canOpen = marker === "_"
+      ? leftFlanking && (!rightFlanking || beforePunctuation)
+      : leftFlanking;
+    const canClose = marker === "_"
+      ? rightFlanking && (!leftFlanking || afterPunctuation)
+      : rightFlanking;
+
+    const units: Delimiter[] = [];
+    let cursor = start;
+    let remaining = runWidth;
+    if (marker === "~") {
+      while (remaining >= 2) {
+        units.push({ start: cursor, end: cursor + 2, marker, width: 2 });
+        cursor += 2;
+        remaining -= 2;
+      }
+    } else {
+      while (remaining > 0) {
+        const width = remaining >= 3 ? 3 : remaining >= 2 ? 2 : 1;
+        units.push({ start: cursor, end: cursor + width, marker, width });
+        cursor += width;
+        remaining -= width;
+      }
+    }
+
+    const unpaired: Delimiter[] = [];
+    for (let unitIndex = units.length - 1; unitIndex >= 0; unitIndex--) {
+      const unit = units[unitIndex];
+      const key = marker + ":" + unit.width;
+      const stack = openers.get(key);
+      if (canClose && stack && stack.length > 0) {
+        const opener = stack.pop()!;
+        removed.fill(1, opener.start, opener.end);
+        removed.fill(1, unit.start, unit.end);
+      } else {
+        unpaired.push(unit);
+      }
+    }
+    if (canOpen) {
+      for (let unitIndex = unpaired.length - 1; unitIndex >= 0; unitIndex--) {
+        const unit = unpaired[unitIndex];
+        const key = marker + ":" + unit.width;
+        const stack = openers.get(key) ?? [];
+        stack.push(unit);
+        openers.set(key, stack);
+      }
+    }
   }
-  return text;
+
+  let out = "";
+  for (let i = 0; i < source.length; i++) {
+    if (!removed[i]) out += source[i];
+  }
+  return out;
 }
 
 const CODE_LT = "\uE000";

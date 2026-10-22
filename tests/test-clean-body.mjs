@@ -398,6 +398,38 @@ eq("attribute-bearing code flattens visible inline emphasis",
   "\u0060bold and gone\u0060",
   undefined,
   '<p><code class="notranslate"><em>bold</em> and <del>gone</del></code></p>');
+eq("raw code flattens nested emphasis in GitHub's rendered order",
+  '<code class="x">**bold *inside* marker**</code>',
+  "\u0060bold inside marker\u0060",
+  undefined,
+  '<p><code class="notranslate"><strong>bold <em>inside</em> marker</strong></code></p>');
+eq("raw code flattens emphasis nested inside strong text",
+  '<code class="x">*bold **inside** marker*</code>',
+  "\u0060bold inside marker\u0060",
+  undefined,
+  '<p><code class="notranslate"><em>bold <strong>inside</strong> marker</em></code></p>');
+eq("intraword underscores stay literal inside raw code",
+  '<code class="x">foo_bar_baz and foo__bar__baz</code>',
+  "\u0060foo_bar_baz and foo__bar__baz\u0060",
+  undefined,
+  '<p><code class="notranslate">foo_bar_baz and foo__bar__baz</code></p>');
+eq("unpaired triple-star runs stay literal as returned by GitHub",
+  '<code class="x">***a ***a</code>',
+  "\u0060***a ***a\u0060",
+  undefined,
+  '<p><code class="notranslate">***a ***a</code></p>');
+eq("strikethrough flattens only the paired outer delimiters",
+  '<code class="x">~~strike ~~ inside~~</code>',
+  "\u0060strike ~~ inside\u0060",
+  undefined,
+  '<p><code class="notranslate"><del>strike ~~ inside</del></code></p>');
+const emphasisStress = '***a' + ' ***a'.repeat(10000);
+const markdownTick = String.fromCharCode(96);
+eq("50 KB of unmatched emphasis candidates remain literal",
+  '<code class="x">' + emphasisStress + '</code>',
+  markdownTick + emphasisStress + markdownTick,
+  undefined,
+  '<p><code class="notranslate">' + emphasisStress + '</code></p>');
 eq("attribute-bearing code pads a visible leading backtick safely",
   '<code class="x">\\`leading</code>', '`` `leading ``', '`leading',
   '<p><code class="notranslate">`leading</code></p>');
