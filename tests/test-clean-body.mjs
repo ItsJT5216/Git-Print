@@ -195,6 +195,16 @@ eq("details boilerplate removed",
 eq("details furniture split by a break tag is still removed",
   "Keep this.\n<details><summary>Review<br>info</summary>Promo body</details>",
   "Keep this.");
+eq("nested CodeRabbit run-configuration details do not leak HTML closers",
+  '> <details>\n> <summary><strong>Review skipped</strong></summary>\n> <dl>\n> <dd>\n> \n' +
+  '> <details>\n> <summary><strong>⚙️ Run configuration</strong></summary>\n> <dl>\n> <dd>\n> \n' +
+  '> - **Configuration used**: Organization UI\n> - **Review profile**: CHILL\n> </dd>\n> </dl>\n> </details>\n> </dd>\n> </dl>\n> </details>',
+  '**Review skipped**',
+  undefined,
+  '<blockquote>\n<details>\n<summary><strong>Review skipped</strong></summary>\n<dl>\n<dd>\n<details>\n' +
+  '<summary><strong>⚙️ Run configuration</strong></summary>\n<dl>\n<dd>\n<ul>\n' +
+  '<li><strong>Configuration used</strong>: Organization UI</li>\n<li><strong>Review profile</strong>: CHILL</li>\n' +
+  '</ul>\n</dd>\n</dl>\n</details>\n</dd>\n</dl>\n</details>\n</blockquote>');
 eq("content-bearing details summaries preserve break spacing",
   "<details><summary>Review<br>notes</summary>Useful body.</details>",
   "**Review notes**\n\nUseful body.");
@@ -360,6 +370,11 @@ eq("authored code matches GitHub replacement for invalid numeric references",
   '<p><code class="notranslate">x � � � � � y</code></p>');
 eq("a replacement character alone in authored code is not discarded",
   '<code class="x">&#128;</code>', '`�`', '�', '<p><code>�</code></p>');
+eq("an unmatched backtick does not hide GitHub-rendered raw code",
+  'Before \u0060 unmatched <code>foo</code>',
+  'Before \u0060 unmatched \u0060foo\u0060',
+  undefined,
+  '<p>Before \u0060 unmatched <code class="notranslate">foo</code></p>');
 eq("nested Markdown code keeps its literal HTML spelling",
   '<code class="x">foo `<em>bar</em>`</code>',
   '`foo <em>bar</em>`',
@@ -378,6 +393,11 @@ eq("attribute-bearing code retains escaped visible backticks with a safe delimit
   '<code class="language-js">const s = \\`hi\\`;</code>', '``const s = `hi`;``',
   'const s = `hi`;',
   '<p><code class="notranslate">const s = `hi`;</code></p>');
+eq("attribute-bearing code flattens visible inline emphasis",
+  '<code class="x">*bold* and ~~gone~~</code>',
+  "\u0060bold and gone\u0060",
+  undefined,
+  '<p><code class="notranslate"><em>bold</em> and <del>gone</del></code></p>');
 eq("attribute-bearing code pads a visible leading backtick safely",
   '<code class="x">\\`leading</code>', '`` `leading ``', '`leading',
   '<p><code class="notranslate">`leading</code></p>');
@@ -407,6 +427,11 @@ eq("invisible wrapper is not matched to a later identical literal entity",
   'hello and &lt;center&gt;',
   'hello and <center>',
   'hello and &lt;center&gt;');
+eq("GitHub-visible code tag text does not make a duplicate HTML wrapper visible",
+  'Code \u0060<center>literal</center>\u0060 and <center>invisible</center>',
+  'Code \u0060<center>literal</center>\u0060 and invisible',
+  undefined,
+  '<p>Code <code class="notranslate">&lt;center&gt;literal&lt;/center&gt;</code> and </p>invisible<p></p>');
 
 // body_html values below reflect the GitHub GFM rendering API. It is already
 // returned by the full+json REST calls used by git-print; no live test network
@@ -537,16 +562,76 @@ eq("raw code elements in HTML blocks do not shield images or comments",
   '<div>[x](url) <code>abc</code></div>',
   '[x](url) abc',
   '<div>[x](url) <code>abc<a href="badge.png"><img src="badge.png"></a></code></div>');
+eq("quoted greater-than attributes match GitHub's visible raw tag",
+  'Raw <script title="a > b">value</script> text',
+  'Raw &lt;script title="a &gt; b"&gt;value&lt;/script&gt; text',
+  undefined,
+  '<p>Raw &lt;script title="a &gt; b"&gt;value&lt;/script&gt; text</p>');
+eq("entity spelling in a quoted attribute stays faithful to visible text",
+  'Raw <script title="a &amp;gt; b">value</script> text',
+  'Raw &lt;script title="a &amp;gt; b"&gt;value&lt;/script&gt; text',
+  undefined,
+  '<p>Raw &lt;script title="a &amp;gt; b"&gt;value&lt;/script&gt; text</p>');
 eq("script blocks are escaped as literal text instead of restored as active HTML",
   '<script>raw `code` [link](url)</script>',
   '&lt;script&gt;raw &#96;code&#96; &#91;link&#93;&#40;url&#41;&lt;&#47;script&gt;',
   'raw `code` [link](url)',
   '&lt;script&gt;raw `code` [link](url)&lt;/script&gt;');
+eq("script blocks end only at the matching closing tag name",
+  '<script>one</scriptx>\n[link](url)\n</script>',
+  '&lt;script&gt;one&lt;&#47;scriptx&gt;\n&#91;link&#93;&#40;url&#41;\n&lt;&#47;script&gt;',
+  '<script>one\n[link](url)\n</script>',
+  '&lt;script&gt;one\n[link](url)\n&lt;/script&gt;');
+eq("script blocks recognize an opener split before its tag terminator",
+  '<script\n>one\n\n[x](url)\n</script>',
+  '&lt;script\n&gt;one\n\n&#91;x&#93;&#40;url&#41;\n&lt;&#47;script&gt;',
+  undefined,
+  '&lt;script\n&gt;one\n\n[x](url)\n&lt;/script&gt;');
+eq("quoted raw script text keeps its blockquote prefix",
+  '> <script>value</script>',
+  '> &lt;script&gt;value&lt;&#47;script&gt;',
+  undefined,
+  '<blockquote>\n&lt;script&gt;value&lt;/script&gt;\n</blockquote>');
+eq("script text escapes greater-than characters after the enclosing quote prefix",
+  '> <script>\n> >literal\n> </script>',
+  '> &lt;script&gt;\n> &gt;literal\n> &lt;&#47;script&gt;',
+  undefined,
+  '<blockquote>\n&lt;script&gt;\n&gt;literal\n&lt;/script&gt;\n</blockquote>');
+eq("root script text does not treat leading greater-than data as a quote",
+  '<script>\n> literal\n</script>',
+  '&lt;script&gt;\n&gt; literal\n&lt;&#47;script&gt;',
+  undefined,
+  '&lt;script&gt;\n&gt; literal\n&lt;/script&gt;');
+eq("nested dangerous raw HTML is escaped inside retained blocks",
+  '<div><script>raw [link](url)</script></div>',
+  '<div>&lt;script&gt;raw &#91;link&#93;&#40;url&#41;&lt;&#47;script&gt;</div>',
+  undefined,
+  '<div>&lt;script&gt;raw [link](url)&lt;/script&gt;</div>');
+eq("Unicode case folding cannot shift a raw block closing-tag offset",
+  '<textarea>İ</textarea>\n\nSee [fix](url)',
+  '&lt;textarea&gt;İ&lt;&#47;textarea&gt;\n\nSee fix',
+  undefined,
+  '&lt;textarea&gt;İ&lt;/textarea&gt;\n<p>See <a href="url">fix</a></p>');
+eq("a blockquote HTML block ends before the following root code span",
+  '> <div>quoted</div>\n`<img src=x>`',
+  '> <div>quoted</div>\n`<img src=x>`',
+  undefined,
+  '<blockquote>\n<div>quoted</div>\n</blockquote>\n<p><code class="notranslate">&lt;img src=x&gt;</code></p>');
+eq("a quoted standalone tag does not consume the next lazy code line",
+  '> <x-wrap>quoted</x-wrap>\n`<img src=x>`',
+  '> quoted\n`<img src=x>`',
+  undefined,
+  '<blockquote>\n<p>quoted<br>\n<code class="notranslate">&lt;img src=x&gt;</code></p>\n</blockquote>');
 eq("inline tilde runs do not exclude a confirmed multiline code span",
   'Prefix ~~~ foo `start\n[x](url)\nend` bar ~~~ suffix',
   'Prefix ~~~ foo `start\n[x](url)\nend` bar ~~~ suffix',
   'Prefix ~~~ foo start [x](url) end bar ~~~ suffix',
   '<p>Prefix ~~~ foo <code>start [x](url) end</code> bar ~~~ suffix</p>');
+eq("tilde-fenced examples keep literal tags and link syntax",
+  '~~~xml\n<custom>[x](url)</custom>\n\n<tail>\n~~~',
+  '~~~xml\n<custom>[x](url)</custom>\n\n<tail>\n~~~',
+  undefined,
+  '<div class="highlight highlight-text-xml"><pre class="notranslate">&lt;<span class="pl-ent">custom</span>&gt;[x](url)&lt;/<span class="pl-ent">custom</span>&gt;\n\n&lt;<span class="pl-ent">tail</span>&gt;</pre></div>');
 eq("thematic-break prefixes do not interrupt rendered multiline code",
   'Use `start\n---flag [x](url)\nend` here',
   'Use `start\n---flag [x](url)\nend` here',
@@ -588,6 +673,21 @@ eq("a single-line span does not desynchronize the reported CodeRabbit example",
   'Use x and <div class="a"> y</div> here',
   '<p dir="auto">Use <code class="notranslate">x</code> and <code class="notranslate">&lt;div class="a"&gt; y&lt;/div&gt;</code> here</p>');
 const malformedTagRun = `<A ${" ".repeat(256)}${"<".repeat(256)}`;
+eq("backticks in quoted attributes do not consume a following code span",
+  'See <span title="\u0060">use \u0060a <b>literal</b>\u0060</span>',
+  'See use \u0060a <b>literal</b>\u0060',
+  undefined,
+  '<p>See <span title="\u0060">use <code class="notranslate">a &lt;b&gt;literal&lt;/b&gt;</code></span></p>');
+eq("a completed double-backtick span discards inner delimiter candidates",
+  'Use \u0060\u0060outer \u0060 tick\u0060\u0060 and \u0060literal <code>x</code>\u0060',
+  'Use \u0060\u0060outer \u0060 tick\u0060\u0060 and \u0060literal <code>x</code>\u0060',
+  undefined,
+  '<p>Use <code class="notranslate">outer \u0060 tick</code> and <code class="notranslate">literal &lt;code&gt;x&lt;/code&gt;</code></p>');
+eq("a thematic-break prefix does not interrupt a complete source line",
+  'Use \u0060start\n---[x](url)\nend\u0060 here',
+  'Use \u0060start\n---[x](url)\nend\u0060 here',
+  'Use start ---[x](url) end here',
+  '<p>Use <code class="notranslate">start ---[x](url) end</code> here</p>');
 eq("malformed tag-like text in a multiline span stays literal",
   `Before \`start\n  ${malformedTagRun}\nend\` after`,
   `Before \`start\n  ${malformedTagRun}\nend\` after`);
